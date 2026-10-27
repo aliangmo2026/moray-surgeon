@@ -1,0 +1,380 @@
+{
+  "additionalProperties": false,
+  "description": "An ordered batch of refactor instructions plus a human summary.",
+  "properties": {
+    "instructions": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "add_type_hints": {
+              "additionalProperties": false,
+              "description": "Add type hints to one function, or to the whole file if function_name is None.",
+              "properties": {
+                "action": {
+                  "const": "add_type_hints",
+                  "default": "add_type_hints",
+                  "title": "Action",
+                  "type": "string"
+                },
+                "function_name": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "Function Name"
+                },
+                "reasoning": {
+                  "default": "",
+                  "title": "Reasoning",
+                  "type": "string"
+                },
+                "target_file": {
+                  "title": "Target File",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target_file"
+              ],
+              "title": "AddTypeHints",
+              "type": "object"
+            },
+            "extract_function": {
+              "additionalProperties": false,
+              "description": "Extract lines [start_line, end_line] into a new named function.\n\nNOTE: start_line <= end_line is enforced by the engine layer, not here.",
+              "properties": {
+                "action": {
+                  "const": "extract_function",
+                  "default": "extract_function",
+                  "title": "Action",
+                  "type": "string"
+                },
+                "end_line": {
+                  "minimum": 1,
+                  "title": "End Line",
+                  "type": "integer"
+                },
+                "function_name": {
+                  "title": "Function Name",
+                  "type": "string"
+                },
+                "reasoning": {
+                  "default": "",
+                  "title": "Reasoning",
+                  "type": "string"
+                },
+                "start_line": {
+                  "minimum": 1,
+                  "title": "Start Line",
+                  "type": "integer"
+                },
+                "target_file": {
+                  "title": "Target File",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target_file",
+                "function_name",
+                "start_line",
+                "end_line"
+              ],
+              "title": "ExtractFunction",
+              "type": "object"
+            },
+            "noop": {
+              "additionalProperties": false,
+              "description": "Explicit no-operation carrying a human-readable message.",
+              "properties": {
+                "action": {
+                  "const": "noop",
+                  "default": "noop",
+                  "title": "Action",
+                  "type": "string"
+                },
+                "message": {
+                  "default": "Nothing to do.",
+                  "title": "Message",
+                  "type": "string"
+                },
+                "reasoning": {
+                  "default": "",
+                  "title": "Reasoning",
+                  "type": "string"
+                }
+              },
+              "title": "Noop",
+              "type": "object"
+            },
+            "rename_symbol": {
+              "additionalProperties": false,
+              "description": "Rename a symbol (function/class/variable) within one file.",
+              "properties": {
+                "action": {
+                  "const": "rename_symbol",
+                  "default": "rename_symbol",
+                  "title": "Action",
+                  "type": "string"
+                },
+                "new_name": {
+                  "title": "New Name",
+                  "type": "string"
+                },
+                "old_name": {
+                  "title": "Old Name",
+                  "type": "string"
+                },
+                "reasoning": {
+                  "default": "",
+                  "title": "Reasoning",
+                  "type": "string"
+                },
+                "target_file": {
+                  "title": "Target File",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target_file",
+                "old_name",
+                "new_name"
+              ],
+              "title": "RenameSymbol",
+              "type": "object"
+            },
+            "replace_call": {
+              "additionalProperties": false,
+              "description": "Replace one call expression with another within one file.",
+              "properties": {
+                "action": {
+                  "const": "replace_call",
+                  "default": "replace_call",
+                  "title": "Action",
+                  "type": "string"
+                },
+                "new_call": {
+                  "title": "New Call",
+                  "type": "string"
+                },
+                "old_call": {
+                  "title": "Old Call",
+                  "type": "string"
+                },
+                "reasoning": {
+                  "default": "",
+                  "title": "Reasoning",
+                  "type": "string"
+                },
+                "target_file": {
+                  "title": "Target File",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target_file",
+                "old_call",
+                "new_call"
+              ],
+              "title": "ReplaceCall",
+              "type": "object"
+            }
+          },
+          "propertyName": "action"
+        },
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "Rename a symbol (function/class/variable) within one file.",
+            "properties": {
+              "action": {
+                "const": "rename_symbol",
+                "default": "rename_symbol",
+                "title": "Action",
+                "type": "string"
+              },
+              "new_name": {
+                "title": "New Name",
+                "type": "string"
+              },
+              "old_name": {
+                "title": "Old Name",
+                "type": "string"
+              },
+              "reasoning": {
+                "default": "",
+                "title": "Reasoning",
+                "type": "string"
+              },
+              "target_file": {
+                "title": "Target File",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target_file",
+              "old_name",
+              "new_name"
+            ],
+            "title": "RenameSymbol",
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Extract lines [start_line, end_line] into a new named function.\n\nNOTE: start_line <= end_line is enforced by the engine layer, not here.",
+            "properties": {
+              "action": {
+                "const": "extract_function",
+                "default": "extract_function",
+                "title": "Action",
+                "type": "string"
+              },
+              "end_line": {
+                "minimum": 1,
+                "title": "End Line",
+                "type": "integer"
+              },
+              "function_name": {
+                "title": "Function Name",
+                "type": "string"
+              },
+              "reasoning": {
+                "default": "",
+                "title": "Reasoning",
+                "type": "string"
+              },
+              "start_line": {
+                "minimum": 1,
+                "title": "Start Line",
+                "type": "integer"
+              },
+              "target_file": {
+                "title": "Target File",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target_file",
+              "function_name",
+              "start_line",
+              "end_line"
+            ],
+            "title": "ExtractFunction",
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Add type hints to one function, or to the whole file if function_name is None.",
+            "properties": {
+              "action": {
+                "const": "add_type_hints",
+                "default": "add_type_hints",
+                "title": "Action",
+                "type": "string"
+              },
+              "function_name": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Function Name"
+              },
+              "reasoning": {
+                "default": "",
+                "title": "Reasoning",
+                "type": "string"
+              },
+              "target_file": {
+                "title": "Target File",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target_file"
+            ],
+            "title": "AddTypeHints",
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Replace one call expression with another within one file.",
+            "properties": {
+              "action": {
+                "const": "replace_call",
+                "default": "replace_call",
+                "title": "Action",
+                "type": "string"
+              },
+              "new_call": {
+                "title": "New Call",
+                "type": "string"
+              },
+              "old_call": {
+                "title": "Old Call",
+                "type": "string"
+              },
+              "reasoning": {
+                "default": "",
+                "title": "Reasoning",
+                "type": "string"
+              },
+              "target_file": {
+                "title": "Target File",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target_file",
+              "old_call",
+              "new_call"
+            ],
+            "title": "ReplaceCall",
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Explicit no-operation carrying a human-readable message.",
+            "properties": {
+              "action": {
+                "const": "noop",
+                "default": "noop",
+                "title": "Action",
+                "type": "string"
+              },
+              "message": {
+                "default": "Nothing to do.",
+                "title": "Message",
+                "type": "string"
+              },
+              "reasoning": {
+                "default": "",
+                "title": "Reasoning",
+                "type": "string"
+              }
+            },
+            "title": "Noop",
+            "type": "object"
+          }
+        ]
+      },
+      "title": "Instructions",
+      "type": "array"
+    },
+    "summary": {
+      "default": "",
+      "title": "Summary",
+      "type": "string"
+    }
+  },
+  "title": "RefactorPlan",
+  "type": "object"
+}
