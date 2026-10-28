@@ -10,6 +10,7 @@ from pydantic import TypeAdapter, ValidationError
 from rich.console import Console
 
 from moray_surgeon.schema import (
+    AddImport,
     AddTypeHints,
     CircularSchemaError,
     ExtractFunction,
@@ -17,6 +18,7 @@ from moray_surgeon.schema import (
     MorayError,
     Noop,
     RefactorPlan,
+    RemoveImport,
     RenameSymbol,
     ReplaceCall,
     SchemaInlineError,
@@ -32,6 +34,7 @@ INSTRUCTION_ADAPTER = TypeAdapter(Instruction)
 ACTION_SAMPLES: list[tuple[dict[str, Any], type[Any]]] = [
     (
         {
+            "id": "step1",
             "action": "rename_symbol",
             "target_file": "pkg/mod.py",
             "old_name": "foo",
@@ -41,6 +44,7 @@ ACTION_SAMPLES: list[tuple[dict[str, Any], type[Any]]] = [
     ),
     (
         {
+            "id": "step2",
             "action": "extract_function",
             "target_file": "pkg/mod.py",
             "function_name": "helper",
@@ -49,9 +53,10 @@ ACTION_SAMPLES: list[tuple[dict[str, Any], type[Any]]] = [
         },
         ExtractFunction,
     ),
-    ({"action": "add_type_hints", "target_file": "pkg/mod.py"}, AddTypeHints),
+    ({"id": "step3", "action": "add_type_hints", "target_file": "pkg/mod.py"}, AddTypeHints),
     (
         {
+            "id": "step4",
             "action": "replace_call",
             "target_file": "pkg/mod.py",
             "old_call": "f(x)",
@@ -59,7 +64,27 @@ ACTION_SAMPLES: list[tuple[dict[str, Any], type[Any]]] = [
         },
         ReplaceCall,
     ),
-    ({"action": "noop"}, Noop),
+    (
+        {
+            "id": "step5",
+            "action": "add_import",
+            "target_file": "pkg/mod.py",
+            "module": "collections.abc",
+            "name": "Iterable",
+        },
+        AddImport,
+    ),
+    (
+        {
+            "id": "step6",
+            "action": "remove_import",
+            "target_file": "pkg/mod.py",
+            "module": "collections.abc",
+            "name": "Iterable",
+        },
+        RemoveImport,
+    ),
+    ({"id": "step7", "action": "noop"}, Noop),
 ]
 
 # REGENERATE: REGEN_SNAPSHOT=1 pytest tests/test_schema.py
@@ -113,19 +138,20 @@ def test_round_trip_is_stable(payload: dict[str, Any], _expected_type: type[Any]
 
 def test_reasoning_defaults_to_empty() -> None:
     """reasoning is audit-only and must default to '' when omitted."""
-    instruction = INSTRUCTION_ADAPTER.validate_python({"action": "noop"})
+    instruction = INSTRUCTION_ADAPTER.validate_python({"id": "step1", "action": "noop"})
     assert instruction.reasoning == ""
+    assert instruction.depends_on == []
 
 
 def test_noop_message_default() -> None:
     """noop must carry the documented default message."""
-    assert Noop().message == "Nothing to do."
+    assert Noop(id="s1").message == "Nothing to do."
 
 
 def test_add_type_hints_function_name_is_optional() -> None:
     """Omitting function_name means whole-file scope and must parse to None."""
     instruction = INSTRUCTION_ADAPTER.validate_python(
-        {"action": "add_type_hints", "target_file": "pkg/mod.py"}
+        {"id": "step1", "action": "add_type_hints", "target_file": "pkg/mod.py"}
     )
     assert isinstance(instruction, AddTypeHints)
     assert instruction.function_name is None
@@ -134,9 +160,10 @@ def test_add_type_hints_function_name_is_optional() -> None:
 @pytest.mark.parametrize(
     ("payload", "match"),
     [
-        ({"action": "explode", "target_file": "a.py"}, "Input tag"),
+        ({"id": "step1", "action": "explode", "target_file": "a.py"}, "Input tag"),
         (
             {
+                "id": "step1",
                 "action": "rename_symbol",
                 "target_file": "../evil.py",
                 "old_name": "a",
@@ -146,6 +173,7 @@ def test_add_type_hints_function_name_is_optional() -> None:
         ),
         (
             {
+                "id": "step1",
                 "action": "rename_symbol",
                 "target_file": "/abs/path.py",
                 "old_name": "a",
@@ -154,13 +182,23 @@ def test_add_type_hints_function_name_is_optional() -> None:
             "relative",
         ),
         (
-            {"action": "rename_symbol", "target_file": "a.txt", "old_name": "a", "new_name": "b"},
+            {
+                "id": "step1",
+                "action": "rename_symbol",
+                "target_file": "a.txt",
+                "old_name": "a",
+                "new_name": "b",
+            },
             r"end with \.py",
         ),
-        ({"action": "noop", "unexpected": 1}, "unexpected"),
-        ({"action": "rename_symbol", "target_file": "a.py", "new_name": "b"}, "old_name"),
+        ({"id": "step1", "action": "noop", "unexpected": 1}, "unexpected"),
+        (
+            {"id": "step1", "action": "rename_symbol", "target_file": "a.py", "new_name": "b"},
+            "old_name",
+        ),
         (
             {
+                "id": "step1",
                 "action": "extract_function",
                 "target_file": "a.py",
                 "function_name": "f",
@@ -169,17 +207,37 @@ def test_add_type_hints_function_name_is_optional() -> None:
             },
             "greater than or equal to 1",
         ),
+        ({"action": "noop"}, "Field required"),
+        ({"id": "", "action": "noop"}, "String should match pattern"),
+        ({"id": "step 1", "action": "noop"}, "String should match pattern"),
+        ({"id": "step1", "action": "noop", "depends_on": ["step 2"]}, "instruction ids"),
+        ({"id": "step1", "action": "noop", "depends_on": ["a", "a"]}, "repeats"),
     ],
 )
 def test_invalid_payload_raises_validation_error(payload: dict[str, Any], match: str) -> None:
-    """Bad actions, paths, extra keys, missing fields and bad ranges must all fail."""
+    """Bad actions, paths, ids, extra keys, missing fields and bad ranges must all fail."""
     with pytest.raises(ValidationError, match=match):
         INSTRUCTION_ADAPTER.validate_python(payload)
 
 
+def test_depends_on_parses_and_round_trips() -> None:
+    """depends_on must survive serialization exactly as authored."""
+    payload = {
+        "id": "step2",
+        "action": "add_import",
+        "target_file": "pkg/mod.py",
+        "module": "pathlib",
+        "depends_on": ["step1"],
+    }
+    instruction = INSTRUCTION_ADAPTER.validate_python(payload)
+    assert instruction.depends_on == ["step1"]
+    assert instruction.model_dump()["depends_on"] == ["step1"]
+    assert INSTRUCTION_ADAPTER.validate_python(instruction.model_dump()) == instruction
+
+
 def test_frozen_instance_rejects_assignment() -> None:
     """Frozen models must reject attribute writes after construction."""
-    instance = RenameSymbol(target_file="a.py", old_name="A", new_name="B")
+    instance = RenameSymbol(id="s2", target_file="a.py", old_name="A", new_name="B")
     # pydantic v2 frozen models raise ValidationError (frozen_instance) rather
     # than the stdlib FrozenInstanceError; accept any of the three.
     with pytest.raises((AttributeError, TypeError, ValidationError)):
@@ -261,11 +319,33 @@ def test_export_schema_shape() -> None:
     assert "$defs" not in schema
 
 
+def test_exported_schema_requires_id_and_documents_depends_on() -> None:
+    """Every branch must require the DAG fields the dispatcher relies on."""
+    items = RefactorPlan.export_schema()["properties"]["instructions"]["items"]
+
+    for branch in items["oneOf"]:
+        properties = branch["properties"]
+        assert "id" in properties
+        assert "id" in branch["required"]
+        assert properties["id"]["pattern"] == "^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+        assert properties["depends_on"]["type"] == "array"
+        assert properties["depends_on"]["items"]["type"] == "string"
+        assert "depends_on" not in branch["required"]
+
+
 def test_discriminator_mapping_values_are_inlined_dicts() -> None:
     """Every mapping value must be the inlined branch dict, never a $ref string."""
     items = RefactorPlan.export_schema()["properties"]["instructions"]["items"]
     mapping = items["discriminator"]["mapping"]
-    expected_tags = {"rename_symbol", "extract_function", "add_type_hints", "replace_call", "noop"}
+    expected_tags = {
+        "rename_symbol",
+        "extract_function",
+        "add_type_hints",
+        "replace_call",
+        "add_import",
+        "remove_import",
+        "noop",
+    }
     assert set(mapping) == expected_tags
     assert all(isinstance(branch, dict) for branch in mapping.values())
     assert all("$ref" not in branch for branch in mapping.values())

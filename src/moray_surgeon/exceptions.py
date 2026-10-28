@@ -37,6 +37,29 @@ class InstructionError(MorayError):
         self.instruction_index = instruction_index
 
 
+class DependencyError(MorayError):
+    """The plan's step graph cannot be executed as written.
+
+    Covers the three ways a ``depends_on`` graph fails before any file is
+    touched: a repeated id, an id that names no step, or a cycle. The error is
+    deterministic — replanning the same JSON cannot fix it — so callers report it
+    rather than retrying blindly; ``IntentParser`` does retry, because there the
+    graph came from the model and the model can be told exactly what was wrong.
+    """
+
+
+class DuplicateInstructionIdError(DependencyError):
+    """Two instructions share one id, so ``depends_on`` would be ambiguous."""
+
+
+class UnknownDependencyError(DependencyError):
+    """``depends_on`` names an id that is not part of the plan."""
+
+
+class CircularDependencyError(DependencyError):
+    """The ``depends_on`` graph contains a cycle, so no execution order exists."""
+
+
 class GitError(MorayError):
     """Raised when a git command fails or the repo cannot host a transaction.
 
@@ -47,3 +70,16 @@ class GitError(MorayError):
     def __init__(self, message: str, stderr: str = "") -> None:
         super().__init__(message)
         self.stderr = stderr
+
+
+class ScopeViolationError(MorayError):
+    """Raised when an attempt changed AST nodes its plan did not authorise.
+
+    ``violations`` holds the qualified names of the offending nodes (or the
+    affected file paths for created/deleted files), so callers can feed a
+    machine-readable list back to the model or a log.
+    """
+
+    def __init__(self, message: str, violations: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.violations = violations

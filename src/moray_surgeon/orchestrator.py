@@ -5,6 +5,12 @@ failure raises an internal signal that makes the context manager roll the
 working tree back to HEAD, so the next attempt always re-plans from a clean
 baseline instead of patching up a broken tree.
 
+Two gates run inside the transaction. The **verification gate** executes ruff,
+mypy and pytest. The **AST scope gate** fingerprints every Python file before the
+plan and proves afterwards that only nodes the plan authorises changed; a
+violation is treated exactly like a red gate (rollback + retry with feedback), so
+a plan can never quietly rewrite a function it never mentioned.
+
 When an attempt fails, the worktree diff is captured *before* the rollback and
 handed to the next parse together with the verification feedback. The model then
 sees both what it changed and why it broke, while the repository it plans against
@@ -22,6 +28,12 @@ from typing import TYPE_CHECKING
 
 from moray_surgeon.engine.dispatcher import execute_plan
 from moray_surgeon.engine.repo_map import generate_repo_map
+from moray_surgeon.engine.scope_guard import (
+    RepositorySnapshot,
+    snapshot_repository,
+    verify_repository_scope,
+)
+from moray_surgeon.exceptions import ScopeViolationError
 from moray_surgeon.intent import IntentParser
 from moray_surgeon.schema import Noop, RefactorPlan
 from moray_surgeon.transaction import TransactionManager
@@ -108,6 +120,7 @@ class Orchestrator:
         verifier: Verifier,
         max_attempts: int = 3,
         trace: LiveTrace | None = None,
+        scope_guard: bool = True,
     ) -> None:
         """Store collaborators; the orchestrator owns no I/O of its own.
 
@@ -117,11 +130,15 @@ class Orchestrator:
             max_attempts: Maximum plan/apply/verify rounds.
             trace: Optional LiveTrace template. The orchestrator clones it per
                 attempt via ``for_attempt``; None disables all narration.
+            scope_guard: Fingerprint the repository before each attempt and
+                reject changes outside the plan. Disable only for a deliberately
+                out-of-scope emergency; it is the second safety gate.
         """
         self._parser = parser
         self._verifier = verifier
         self._max_attempts = max_attempts
         self._trace = trace
+        self._scope_guard = scope_guard
 
     def run(
         self,
@@ -201,9 +218,17 @@ class Orchestrator:
                 with TransactionManager(
                     repo_root, commit_message=f"moray-surgeon: {intent[:60]}"
                 ):
+                    scope_snapshot: RepositorySnapshot | None = None
+                    if self._scope_guard:
+                        with trace.step("Recording AST scope fingerprints..."):
+                            # Inside the transaction, so user changes are already
+                            # stashed and the baseline matches what the plan edits.
+                            scope_snapshot = snapshot_repository(repo_root)
                     with trace.step("Applying AST instructions..."):
                         log = execute_plan(plan, repo_root)
                     trace.success(f"Plan applied. Modified {modified} file(s).")
+                    if scope_snapshot is not None:
+                        _verify_scope_gate(scope_snapshot, repo_root, plan, trace)
                     if dry_run:
                         diff = _capture_diff(repo_root)
                         trace.info("Dry run: collecting the diff and rolling back...")
@@ -263,6 +288,41 @@ def _modified_file_count(plan: RefactorPlan) -> int:
     return len(
         {item.target_file for item in plan.instructions if not isinstance(item, Noop)}
     )
+
+
+def _verify_scope_gate(
+    snapshot: RepositorySnapshot,
+    repo_root: Path,
+    plan: RefactorPlan,
+    trace: LiveTrace | _NullTrace,
+) -> None:
+    """Enforce the AST scope gate, turning a violation into a retryable failure.
+
+    The diff is captured before raising: the enclosing transaction is about to
+    reset the worktree, and the evidence must survive the rollback. Raising the
+    same internal signal a red verification uses means the attempt is rolled back
+    and the next plan request carries the offending node names.
+
+    Raises:
+        _VerificationFailed: A node outside the plan's authorisation changed.
+    """
+    try:
+        verify_repository_scope(snapshot, repo_root, plan)
+    except ScopeViolationError as exc:
+        trace.error("AST scope violation! Rollback initiated.")
+        raise _VerificationFailed(
+            VerifyResult(
+                ok=False,
+                stage="scope",
+                stdout=(
+                    "The AST scope guard rejected this plan: it changed code the "
+                    "plan does not authorise.\n"
+                    f"Offending node(s): {', '.join(exc.violations)}\n"
+                    "Narrow the plan to the symbols you actually want to change."
+                ),
+            ),
+            _capture_diff(repo_root),
+        ) from exc
 
 
 def _capture_diff(repo_root: Path) -> str:

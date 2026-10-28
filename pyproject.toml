@@ -45,6 +45,15 @@ version = { attr = "moray_surgeon.__version__" }
 line-length = 100
 target-version = "py311"
 
+[tool.mypy]
+python_version = "3.11"
+
+# jedi ships no type information. The rename atom wraps its API behind small,
+# locally typed helpers, so a stub package would add a dependency for no gain.
+[[tool.mypy.overrides]]
+module = "jedi"
+ignore_missing_imports = true
+
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "ANN", "B", "SIM", "RUF"]
 

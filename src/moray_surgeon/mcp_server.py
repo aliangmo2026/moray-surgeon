@@ -23,7 +23,9 @@ from moray_surgeon.verify import Verifier, VerifyResult
 # "mcp>=1.0.0" means both ranges are installable, so import the name that exists
 # while keeping one `mcp = FastMCP("moray-surgeon")` construction below.
 try:  # mcp 1.x
-    from mcp.server.fastmcp import FastMCP
+    # Under mcp 2.x the module exists without this attribute, which is exactly
+    # the case the except branch below handles; mypy only sees the 2.x install.
+    from mcp.server.fastmcp import FastMCP  # type: ignore[attr-defined]
 except ModuleNotFoundError as exc:  # mcp 2.x
     if exc.name != "mcp.server.fastmcp":
         raise
@@ -42,7 +44,12 @@ _ACTIONS_MARKDOWN = """# moray-surgeon actions
 A plan is one JSON object:
 {"instructions": [...], "summary": "short description"}
 
+Steps execute in dependency order. A step with no `depends_on` keeps the order it
+appears in; a step whose dependency has not run yet waits for it.
+
 Common fields:
+- `id`: unique step id inside the plan, e.g. "step1" (letters, digits, `._:-`).
+- `depends_on`: optional list of step ids that must execute before this one.
 - `action`: one of the actions below.
 - `target_file`: repository-relative POSIX path ending in `.py`; no absolute
   paths and no `..`.
@@ -69,14 +76,27 @@ Replace the callee of every call whose callee text equals `old_call`.
 Arguments and formatting are preserved.
 Fields: `old_call`, `new_call` (a valid Python expression).
 
+## add_import
+Add one module-level import to `target_file`, keeping the import block sorted.
+Fields: `module` (dotted path), `name` (string or null), `alias` (string or null).
+`name` null writes `import module`; otherwise `from module import name`.
+Matching imports that already exist are reported as a no-op.
+
+## remove_import
+Remove a module-level import from `target_file`.
+Fields: `module` (dotted path), `name` (string or null).
+`name` null removes every import of `module`; otherwise only that name is
+dropped from `from module import ...` statements.
+
 ## noop
 Explicitly do nothing. Use it when the intent requires no edit.
 Fields: `message` (optional).
 
 Example:
-{"instructions": [{"action": "rename_symbol", "target_file": "src/app.py",
-"old_name": "parse_args", "new_name": "parse_cli_options"}],
-"summary": "rename the parser entry point"}
+{"instructions": [{"id": "step1", "action": "add_import", "target_file": "src/app.py",
+"module": "logging"}, {"id": "step2", "action": "replace_call", "target_file":
+"src/app.py", "old_call": "print", "new_call": "logging.info", "depends_on":
+["step1"]}], "summary": "route print through logging"}
 """
 
 _REPO_HINT = (

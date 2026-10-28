@@ -1,11 +1,81 @@
 {
   "additionalProperties": false,
-  "description": "An ordered batch of refactor instructions plus a human summary.",
+  "description": "A batch of refactor instructions plus a human summary.\n\nThe list order is the authoring order, not necessarily the execution order:\n``engine.dag.topological_sort`` reorders the batch so every ``depends_on``\nedge is honoured, and the dispatcher executes that order.",
   "properties": {
     "instructions": {
       "items": {
         "discriminator": {
           "mapping": {
+            "add_import": {
+              "additionalProperties": false,
+              "description": "Add one module-level import, keeping the file's import block sorted.\n\n``name=None`` writes ``import <module> [as alias]``; otherwise\n``from <module> import <name> [as alias]`` is written. When a matching\n``from`` statement already exists the name is merged into it instead of\ncreating a second statement.",
+              "properties": {
+                "action": {
+                  "const": "add_import",
+                  "default": "add_import",
+                  "title": "Action",
+                  "type": "string"
+                },
+                "alias": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "Alias"
+                },
+                "depends_on": {
+                  "description": "Ids of the steps that must execute before this one.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Depends On",
+                  "type": "array"
+                },
+                "id": {
+                  "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                  "title": "Id",
+                  "type": "string"
+                },
+                "module": {
+                  "title": "Module",
+                  "type": "string"
+                },
+                "name": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "Name"
+                },
+                "reasoning": {
+                  "default": "",
+                  "title": "Reasoning",
+                  "type": "string"
+                },
+                "target_file": {
+                  "title": "Target File",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "target_file",
+                "module"
+              ],
+              "title": "AddImport",
+              "type": "object"
+            },
             "add_type_hints": {
               "additionalProperties": false,
               "description": "Add type hints to one function, or to the whole file if function_name is None.",
@@ -15,6 +85,14 @@
                   "default": "add_type_hints",
                   "title": "Action",
                   "type": "string"
+                },
+                "depends_on": {
+                  "description": "Ids of the steps that must execute before this one.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Depends On",
+                  "type": "array"
                 },
                 "function_name": {
                   "anyOf": [
@@ -28,6 +106,12 @@
                   "default": null,
                   "title": "Function Name"
                 },
+                "id": {
+                  "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                  "title": "Id",
+                  "type": "string"
+                },
                 "reasoning": {
                   "default": "",
                   "title": "Reasoning",
@@ -39,6 +123,7 @@
                 }
               },
               "required": [
+                "id",
                 "target_file"
               ],
               "title": "AddTypeHints",
@@ -54,6 +139,14 @@
                   "title": "Action",
                   "type": "string"
                 },
+                "depends_on": {
+                  "description": "Ids of the steps that must execute before this one.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Depends On",
+                  "type": "array"
+                },
                 "end_line": {
                   "minimum": 1,
                   "title": "End Line",
@@ -61,6 +154,12 @@
                 },
                 "function_name": {
                   "title": "Function Name",
+                  "type": "string"
+                },
+                "id": {
+                  "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                  "title": "Id",
                   "type": "string"
                 },
                 "reasoning": {
@@ -79,6 +178,7 @@
                 }
               },
               "required": [
+                "id",
                 "target_file",
                 "function_name",
                 "start_line",
@@ -97,6 +197,20 @@
                   "title": "Action",
                   "type": "string"
                 },
+                "depends_on": {
+                  "description": "Ids of the steps that must execute before this one.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Depends On",
+                  "type": "array"
+                },
+                "id": {
+                  "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                  "title": "Id",
+                  "type": "string"
+                },
                 "message": {
                   "default": "Nothing to do.",
                   "title": "Message",
@@ -108,7 +222,68 @@
                   "type": "string"
                 }
               },
+              "required": [
+                "id"
+              ],
               "title": "Noop",
+              "type": "object"
+            },
+            "remove_import": {
+              "additionalProperties": false,
+              "description": "Remove a module-level import from one file.\n\nWith ``name=None`` every import of ``module`` is removed, including\n``from <module> import ...`` statements. With ``name`` set, only that name\nis removed from ``from <module> import ...`` statements.",
+              "properties": {
+                "action": {
+                  "const": "remove_import",
+                  "default": "remove_import",
+                  "title": "Action",
+                  "type": "string"
+                },
+                "depends_on": {
+                  "description": "Ids of the steps that must execute before this one.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Depends On",
+                  "type": "array"
+                },
+                "id": {
+                  "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                  "title": "Id",
+                  "type": "string"
+                },
+                "module": {
+                  "title": "Module",
+                  "type": "string"
+                },
+                "name": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "Name"
+                },
+                "reasoning": {
+                  "default": "",
+                  "title": "Reasoning",
+                  "type": "string"
+                },
+                "target_file": {
+                  "title": "Target File",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "target_file",
+                "module"
+              ],
+              "title": "RemoveImport",
               "type": "object"
             },
             "rename_symbol": {
@@ -119,6 +294,20 @@
                   "const": "rename_symbol",
                   "default": "rename_symbol",
                   "title": "Action",
+                  "type": "string"
+                },
+                "depends_on": {
+                  "description": "Ids of the steps that must execute before this one.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Depends On",
+                  "type": "array"
+                },
+                "id": {
+                  "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                  "title": "Id",
                   "type": "string"
                 },
                 "new_name": {
@@ -140,6 +329,7 @@
                 }
               },
               "required": [
+                "id",
                 "target_file",
                 "old_name",
                 "new_name"
@@ -155,6 +345,20 @@
                   "const": "replace_call",
                   "default": "replace_call",
                   "title": "Action",
+                  "type": "string"
+                },
+                "depends_on": {
+                  "description": "Ids of the steps that must execute before this one.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Depends On",
+                  "type": "array"
+                },
+                "id": {
+                  "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                  "title": "Id",
                   "type": "string"
                 },
                 "new_call": {
@@ -176,6 +380,7 @@
                 }
               },
               "required": [
+                "id",
                 "target_file",
                 "old_call",
                 "new_call"
@@ -197,6 +402,20 @@
                 "title": "Action",
                 "type": "string"
               },
+              "depends_on": {
+                "description": "Ids of the steps that must execute before this one.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Depends On",
+                "type": "array"
+              },
+              "id": {
+                "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                "title": "Id",
+                "type": "string"
+              },
               "new_name": {
                 "title": "New Name",
                 "type": "string"
@@ -216,6 +435,7 @@
               }
             },
             "required": [
+              "id",
               "target_file",
               "old_name",
               "new_name"
@@ -233,6 +453,14 @@
                 "title": "Action",
                 "type": "string"
               },
+              "depends_on": {
+                "description": "Ids of the steps that must execute before this one.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Depends On",
+                "type": "array"
+              },
               "end_line": {
                 "minimum": 1,
                 "title": "End Line",
@@ -240,6 +468,12 @@
               },
               "function_name": {
                 "title": "Function Name",
+                "type": "string"
+              },
+              "id": {
+                "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                "title": "Id",
                 "type": "string"
               },
               "reasoning": {
@@ -258,6 +492,7 @@
               }
             },
             "required": [
+              "id",
               "target_file",
               "function_name",
               "start_line",
@@ -276,6 +511,14 @@
                 "title": "Action",
                 "type": "string"
               },
+              "depends_on": {
+                "description": "Ids of the steps that must execute before this one.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Depends On",
+                "type": "array"
+              },
               "function_name": {
                 "anyOf": [
                   {
@@ -288,6 +531,12 @@
                 "default": null,
                 "title": "Function Name"
               },
+              "id": {
+                "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                "title": "Id",
+                "type": "string"
+              },
               "reasoning": {
                 "default": "",
                 "title": "Reasoning",
@@ -299,6 +548,7 @@
               }
             },
             "required": [
+              "id",
               "target_file"
             ],
             "title": "AddTypeHints",
@@ -312,6 +562,20 @@
                 "const": "replace_call",
                 "default": "replace_call",
                 "title": "Action",
+                "type": "string"
+              },
+              "depends_on": {
+                "description": "Ids of the steps that must execute before this one.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Depends On",
+                "type": "array"
+              },
+              "id": {
+                "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                "title": "Id",
                 "type": "string"
               },
               "new_call": {
@@ -333,11 +597,140 @@
               }
             },
             "required": [
+              "id",
               "target_file",
               "old_call",
               "new_call"
             ],
             "title": "ReplaceCall",
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Add one module-level import, keeping the file's import block sorted.\n\n``name=None`` writes ``import <module> [as alias]``; otherwise\n``from <module> import <name> [as alias]`` is written. When a matching\n``from`` statement already exists the name is merged into it instead of\ncreating a second statement.",
+            "properties": {
+              "action": {
+                "const": "add_import",
+                "default": "add_import",
+                "title": "Action",
+                "type": "string"
+              },
+              "alias": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Alias"
+              },
+              "depends_on": {
+                "description": "Ids of the steps that must execute before this one.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Depends On",
+                "type": "array"
+              },
+              "id": {
+                "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                "title": "Id",
+                "type": "string"
+              },
+              "module": {
+                "title": "Module",
+                "type": "string"
+              },
+              "name": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Name"
+              },
+              "reasoning": {
+                "default": "",
+                "title": "Reasoning",
+                "type": "string"
+              },
+              "target_file": {
+                "title": "Target File",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "target_file",
+              "module"
+            ],
+            "title": "AddImport",
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Remove a module-level import from one file.\n\nWith ``name=None`` every import of ``module`` is removed, including\n``from <module> import ...`` statements. With ``name`` set, only that name\nis removed from ``from <module> import ...`` statements.",
+            "properties": {
+              "action": {
+                "const": "remove_import",
+                "default": "remove_import",
+                "title": "Action",
+                "type": "string"
+              },
+              "depends_on": {
+                "description": "Ids of the steps that must execute before this one.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Depends On",
+                "type": "array"
+              },
+              "id": {
+                "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                "title": "Id",
+                "type": "string"
+              },
+              "module": {
+                "title": "Module",
+                "type": "string"
+              },
+              "name": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Name"
+              },
+              "reasoning": {
+                "default": "",
+                "title": "Reasoning",
+                "type": "string"
+              },
+              "target_file": {
+                "title": "Target File",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "target_file",
+              "module"
+            ],
+            "title": "RemoveImport",
             "type": "object"
           },
           {
@@ -348,6 +741,20 @@
                 "const": "noop",
                 "default": "noop",
                 "title": "Action",
+                "type": "string"
+              },
+              "depends_on": {
+                "description": "Ids of the steps that must execute before this one.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Depends On",
+                "type": "array"
+              },
+              "id": {
+                "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                "title": "Id",
                 "type": "string"
               },
               "message": {
@@ -361,6 +768,9 @@
                 "type": "string"
               }
             },
+            "required": [
+              "id"
+            ],
             "title": "Noop",
             "type": "object"
           }

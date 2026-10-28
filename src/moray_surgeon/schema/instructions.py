@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import keyword
+import re
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
@@ -10,13 +12,51 @@ from moray_surgeon.schema.exceptions import CircularSchemaError, SchemaInlineErr
 
 _REF_PREFIX = "#/$defs/"
 
+# An instruction id is a plan-local key referenced by ``depends_on``; keeping it
+# to an identifier-like alphabet keeps the JSON that reaches the model simple and
+# stops a stray space or a newline from becoming an invisible part of the key.
+_INSTRUCTION_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$"
+_INSTRUCTION_ID_REGEX = re.compile(_INSTRUCTION_ID_PATTERN)
+
 
 class _BaseInstruction(BaseModel):
-    """Shared contract for every instruction: frozen, closed, auditable."""
+    """Shared contract for every instruction: frozen, closed, auditable.
+
+    ``id`` names the step; ``depends_on`` lists the ids that must run first. The
+    dispatcher topologically sorts the plan on these two fields, so a model can
+    describe "rename the class, then rewrite its callers, then add the import"
+    without relying on list position.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    id: str = Field(
+        pattern=_INSTRUCTION_ID_PATTERN,
+        description=(
+            "Unique id of this step inside the plan, for example 'step1'. "
+            "Other steps reference it from depends_on."
+        ),
+    )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        description="Ids of the steps that must execute before this one.",
+    )
     reasoning: str = ""
+
+    @field_validator("depends_on")
+    @classmethod
+    def _validate_depends_on(cls, value: list[str]) -> list[str]:
+        """Reject malformed and repeated ids; graph validity is the DAG's job."""
+        seen: set[str] = set()
+        for dependency in value:
+            if not _INSTRUCTION_ID_REGEX.fullmatch(dependency):
+                raise ValueError(
+                    f"depends_on entries must be instruction ids, got {dependency!r}"
+                )
+            if dependency in seen:
+                raise ValueError(f"depends_on repeats id {dependency!r}")
+            seen.add(dependency)
+        return value
 
 
 class _FileInstruction(_BaseInstruction):
@@ -78,6 +118,77 @@ class ReplaceCall(_FileInstruction):
     new_call: str
 
 
+class AddImport(_FileInstruction):
+    """Add one module-level import, keeping the file's import block sorted.
+
+    ``name=None`` writes ``import <module> [as alias]``; otherwise
+    ``from <module> import <name> [as alias]`` is written. When a matching
+    ``from`` statement already exists the name is merged into it instead of
+    creating a second statement.
+    """
+
+    action: Literal["add_import"] = "add_import"
+    module: str
+    name: str | None = None
+    alias: str | None = None
+
+    @field_validator("module")
+    @classmethod
+    def _validate_module(cls, value: str) -> str:
+        """Reject anything that is not an absolute dotted module path."""
+        return _validate_module_path(value)
+
+    @field_validator("name", "alias")
+    @classmethod
+    def _validate_optional_identifier(cls, value: str | None) -> str | None:
+        """Reject names that could not be written after ``import``/``as``."""
+        return _validate_optional_identifier(value)
+
+
+class RemoveImport(_FileInstruction):
+    """Remove a module-level import from one file.
+
+    With ``name=None`` every import of ``module`` is removed, including
+    ``from <module> import ...`` statements. With ``name`` set, only that name
+    is removed from ``from <module> import ...`` statements.
+    """
+
+    action: Literal["remove_import"] = "remove_import"
+    module: str
+    name: str | None = None
+
+    @field_validator("module")
+    @classmethod
+    def _validate_module(cls, value: str) -> str:
+        """Reject anything that is not an absolute dotted module path."""
+        return _validate_module_path(value)
+
+    @field_validator("name")
+    @classmethod
+    def _validate_optional_name(cls, value: str | None) -> str | None:
+        """Reject names that could never appear in an import statement."""
+        return _validate_optional_identifier(value)
+
+
+def _validate_module_path(value: str) -> str:
+    """Validate an absolute dotted module path such as ``pkg.sub.mod``."""
+    parts = value.split(".")
+    if not value or not all(part.isidentifier() for part in parts):
+        raise ValueError(f"module must be a dotted Python module path, got {value!r}")
+    if any(keyword.iskeyword(part) for part in parts):
+        raise ValueError(f"module must not contain a Python keyword, got {value!r}")
+    return value
+
+
+def _validate_optional_identifier(value: str | None) -> str | None:
+    """Validate an optional identifier; None passes through untouched."""
+    if value is None:
+        return None
+    if not value.isidentifier() or keyword.iskeyword(value):
+        raise ValueError(f"expected a Python identifier, got {value!r}")
+    return value
+
+
 class Noop(_BaseInstruction):
     """Explicit no-operation carrying a human-readable message."""
 
@@ -86,13 +197,24 @@ class Noop(_BaseInstruction):
 
 
 Instruction = Annotated[
-    RenameSymbol | ExtractFunction | AddTypeHints | ReplaceCall | Noop,
+    RenameSymbol
+    | ExtractFunction
+    | AddTypeHints
+    | ReplaceCall
+    | AddImport
+    | RemoveImport
+    | Noop,
     Field(discriminator="action"),
 ]
 
 
 class RefactorPlan(BaseModel):
-    """An ordered batch of refactor instructions plus a human summary."""
+    """A batch of refactor instructions plus a human summary.
+
+    The list order is the authoring order, not necessarily the execution order:
+    ``engine.dag.topological_sort`` reorders the batch so every ``depends_on``
+    edge is honoured, and the dispatcher executes that order.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 

@@ -12,8 +12,12 @@ so commit/rollback still owns the outcome as a unit.
 
 from __future__ import annotations
 
+import importlib
 import keyword
 import logging
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import jedi
@@ -25,6 +29,30 @@ from moray_surgeon.exceptions import PathTraversalError
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
+
+# Only a ceiling for the temporary budget below; a repository larger than this
+# needs an out-of-process index rather than a single Jedi search.
+_MAX_REFERENCE_FILES = 5000
+_SKIP_DIR_NAMES = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "env",
+        "node_modules",
+        "site-packages",
+        "__pycache__",
+        "build",
+        "dist",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".nox",
+    }
+)
 
 
 class _CoarseRename(cst.CSTTransformer):
@@ -162,27 +190,74 @@ def _jedi_positions(
     old_name: str,
 ) -> dict[Path, set[tuple[int, int]]]:
     """Map each in-repo file to the exact ``(line, column)`` positions to rename."""
-    project = jedi.Project(path=str(root))
-    script = jedi.Script(path=str(target), project=project)
-    definitions = [
-        name
-        for name in script.get_names(all_scopes=True, definitions=True, references=False)
-        if name.name == old_name
-    ]
-
     positions: dict[Path, set[tuple[int, int]]] = {}
-    for definition in definitions:
-        references = script.get_references(
-            definition.line, definition.column, scope="project"
-        )
-        for reference in references:
-            if reference.name != old_name or reference.module_path is None:
-                continue
-            path = Path(reference.module_path).resolve()
-            if not path.is_relative_to(root) or not path.is_file():
-                continue
-            positions.setdefault(path, set()).add((reference.line, reference.column))
+    with _jedi_reference_budget(root):
+        project = jedi.Project(path=str(root))
+        script = jedi.Script(path=str(target), project=project)
+        definitions = [
+            name
+            for name in script.get_names(all_scopes=True, definitions=True, references=False)
+            if name.name == old_name
+        ]
+
+        for definition in definitions:
+            references = script.get_references(
+                definition.line, definition.column, scope="project"
+            )
+            for reference in references:
+                if reference.name != old_name or reference.module_path is None:
+                    continue
+                path = Path(reference.module_path).resolve()
+                if not path.is_relative_to(root) or not path.is_file():
+                    continue
+                positions.setdefault(path, set()).add((reference.line, reference.column))
     return positions
+
+
+@contextmanager
+def _jedi_reference_budget(repo_root: Path) -> Iterator[None]:
+    """Temporarily raise Jedi's per-search file budget to cover the repository.
+
+    Jedi hard-codes ``_PARSED_FILE_LIMIT = 30`` and ``_OPENED_FILE_LIMIT = 2000``
+    for project-scope reference searches. Past either limit it silently returns
+    *partial* results, so a rename in a 60-file project would rewrite half the
+    call sites and leave dangling names behind. Raising the budget to the
+    repository's own file count keeps the search complete; the values are
+    restored afterwards so later callers see stock Jedi behaviour.
+
+    The private names are probed defensively: if a future Jedi version renames
+    or removes them, the search still runs (with Jedi's own limits) instead of
+    crashing the engine.
+    """
+    try:
+        references = importlib.import_module("jedi.inference.references")
+    except ImportError:  # pragma: no cover - only a broken/very old Jedi install
+        yield
+        return
+
+    needed = min(_MAX_REFERENCE_FILES, _python_file_count(repo_root) + 200)
+    saved: list[tuple[str, int]] = []
+    for attribute in ("_PARSED_FILE_LIMIT", "_OPENED_FILE_LIMIT"):
+        current = getattr(references, attribute, None)
+        if isinstance(current, int) and needed > current:
+            saved.append((attribute, current))
+            setattr(references, attribute, needed)
+    try:
+        yield
+    finally:
+        for attribute, current in saved:
+            setattr(references, attribute, current)
+
+
+def _python_file_count(root: Path) -> int:
+    """Count .py files under ``root`` without following directory links."""
+    total = 0
+    for _dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(name for name in dirnames if name not in _SKIP_DIR_NAMES)
+        total += sum(1 for name in filenames if name.endswith(".py"))
+        if total >= _MAX_REFERENCE_FILES:
+            return _MAX_REFERENCE_FILES
+    return total
 
 
 def _rename_textually(source: str, old_name: str, new_name: str) -> EditResult:

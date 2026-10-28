@@ -78,13 +78,13 @@ def _init_repo(tmp_path: Path) -> Path:
 def _rename_plan() -> RefactorPlan:
     return RefactorPlan(
         instructions=[
-            RenameSymbol(target_file="app.py", old_name="old_name", new_name="new_name")
+            RenameSymbol(id="s1", target_file="app.py", old_name="old_name", new_name="new_name")
         ]
     )
 
 
 def _noop_plan() -> RefactorPlan:
-    return RefactorPlan(instructions=[Noop(message="nothing to do")])
+    return RefactorPlan(instructions=[Noop(id="s2", message="nothing to do")])
 
 
 def _ok() -> VerifyResult:
@@ -238,7 +238,7 @@ def test_engine_error_propagates_without_retry(tmp_path):
     repo = _init_repo(tmp_path)
     plan = RefactorPlan(
         instructions=[
-            RenameSymbol(target_file="missing.py", old_name="a", new_name="b")
+            RenameSymbol(id="s3", target_file="missing.py", old_name="a", new_name="b")
         ]
     )
     parser = FakeParser([plan])
@@ -277,6 +277,7 @@ def test_trace_reports_success_sequence(tmp_path):
     assert trace.events == [
         ("step", "Requesting plan from LLM..."),
         ("success", "Plan received."),
+        ("step", "Recording AST scope fingerprints..."),
         ("step", "Applying AST instructions..."),
         ("success", "Plan applied. Modified 1 file(s)."),
         ("step", "Running verification (ruff, mypy, pytest)..."),
@@ -299,6 +300,7 @@ def test_trace_reports_rollback_then_retry(tmp_path):
     assert trace.events == [
         ("step", "Requesting plan from LLM..."),
         ("success", "Plan received."),
+        ("step", "Recording AST scope fingerprints..."),
         ("step", "Applying AST instructions..."),
         ("success", "Plan applied. Modified 1 file(s)."),
         ("step", "Running verification (ruff, mypy, pytest)..."),
@@ -306,6 +308,7 @@ def test_trace_reports_rollback_then_retry(tmp_path):
         ("info", "Retrying with error context + code diff..."),
         ("step", "Requesting plan from LLM..."),
         ("success", "Plan received."),
+        ("step", "Recording AST scope fingerprints..."),
         ("step", "Applying AST instructions..."),
         ("success", "Plan applied. Modified 1 file(s)."),
         ("step", "Running verification (ruff, mypy, pytest)..."),
@@ -416,3 +419,98 @@ def test_all_noop_plans_fail_without_touching_git(tmp_path):
     assert report.last_verify is not None and report.last_verify.stage == "noop"
     assert _read(repo / "app.py") == _ORIGINAL
     assert _commit_count(repo) == 1
+
+
+# --------------------------------------------------------------------------- #
+# AST scope gate
+# --------------------------------------------------------------------------- #
+
+_APP_WITH_NEIGHBOUR = (
+    "def old_name():\n"
+    "    return old_name()\n"
+    "\n"
+    "\n"
+    "def neighbour():\n"
+    "    return 1\n"
+)
+
+
+def _repo_with_neighbour(tmp_path: Path) -> Path:
+    repo = _init_repo(tmp_path)
+    _write(repo / "app.py", _APP_WITH_NEIGHBOUR)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add neighbour")
+    return repo
+
+
+def _collateral_edit_dispatcher(tamper_every_time: bool = False):
+    """Fake dispatcher: renames the target and edits an unrelated function."""
+    calls = 0
+
+    def dispatch(plan, repo_root):
+        nonlocal calls
+        calls += 1
+        original = _read(repo_root / "app.py")
+        rewritten = original.replace("old_name", "new_name")
+        if tamper_every_time or calls == 1:
+            rewritten = rewritten.replace("return 1", "return 999")
+        _write(repo_root / "app.py", rewritten)
+        return ["[0] rename_symbol: 2 change(s) in app.py"]
+
+    return dispatch
+
+
+def test_scope_violation_rolls_back_and_retries_with_node_feedback(tmp_path, monkeypatch):
+    repo = _repo_with_neighbour(tmp_path)
+    parser = FakeParser([_rename_plan()])
+    verifier = FakeVerifier([_ok()])
+    monkeypatch.setattr(
+        "moray_surgeon.orchestrator.execute_plan", _collateral_edit_dispatcher()
+    )
+
+    report = Orchestrator(parser, verifier).run("rename old_name", repo)
+
+    assert report.success is True
+    assert report.attempts == 2
+    assert verifier.calls == 1
+    assert "AST scope guard" in parser.contexts[1]
+    assert "neighbour" in parser.contexts[1]
+    assert _read(repo / "app.py") == _APP_WITH_NEIGHBOUR.replace("old_name", "new_name")
+    assert _git(repo, "status", "--porcelain").stdout == ""
+    assert _commit_count(repo) == 3
+
+
+def test_scope_violations_exhaust_the_attempts_and_restore_head(tmp_path, monkeypatch):
+    repo = _repo_with_neighbour(tmp_path)
+    parser = FakeParser([_rename_plan()])
+    verifier = FakeVerifier([_ok()])
+    monkeypatch.setattr(
+        "moray_surgeon.orchestrator.execute_plan",
+        _collateral_edit_dispatcher(tamper_every_time=True),
+    )
+
+    report = Orchestrator(parser, verifier, max_attempts=2).run("rename old_name", repo)
+
+    assert report.success is False
+    assert report.attempts == 2
+    assert verifier.calls == 0
+    assert report.last_verify is not None
+    assert report.last_verify.stage == "scope"
+    assert _read(repo / "app.py") == _APP_WITH_NEIGHBOUR
+    assert _git(repo, "status", "--porcelain").stdout == ""
+    assert _commit_count(repo) == 2
+
+
+def test_scope_guard_can_be_disabled_explicitly(tmp_path, monkeypatch):
+    repo = _repo_with_neighbour(tmp_path)
+    parser = FakeParser([_rename_plan()])
+    verifier = FakeVerifier([_ok()])
+    monkeypatch.setattr(
+        "moray_surgeon.orchestrator.execute_plan", _collateral_edit_dispatcher()
+    )
+
+    report = Orchestrator(parser, verifier, scope_guard=False).run("rename old_name", repo)
+
+    assert report.success is True
+    assert report.attempts == 1
+    assert "return 999" in _read(repo / "app.py")

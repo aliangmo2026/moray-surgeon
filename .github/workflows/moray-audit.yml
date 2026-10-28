@@ -1,0 +1,46 @@
+name: moray-surgeon audit
+
+# Pull-request gate: the diff is fingerprinted against the base branch and the
+# project's own ruff/mypy/pytest gates run unchanged. Nothing is edited or
+# committed — the audit is read-only.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Surgical audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the pull request
+        uses: actions/checkout@v4
+        with:
+          # The base branch has to exist as a local ref so --base-ref resolves.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install moray-surgeon and the verification gates
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Audit the diff against the base branch
+        run: |
+          moray-surgeon audit \
+            --path . \
+            --base-ref "origin/${{ github.base_ref }}" \
+            --json-output moray-audit.json
+
+      - name: Upload the audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: moray-audit-report
+          path: moray-audit.json
+          if-no-files-found: ignore

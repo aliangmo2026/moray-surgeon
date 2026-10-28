@@ -7,8 +7,10 @@ inside the caller's transaction.
 
 Invariants:
 
-* Instructions run strictly in order and the first failure aborts the run.
-  There is no transactional rollback, so earlier edits stay on disk.
+* The plan is topologically sorted on ``id``/``depends_on`` first, so a step
+  never runs before the steps it declares. A plan with no dependencies keeps its
+  authored order. The first failure aborts the run; there is no transactional
+  rollback here, so earlier edits stay on disk.
 * Every path is resolved with ``pathlib`` and must stay inside ``repo_root``.
 * Every read and write is UTF-8.
 * Nothing is printed: the returned log list is the caller's to render.
@@ -19,7 +21,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from moray_surgeon.engine.base import EditResult
+from moray_surgeon.engine.dag import topological_sort
 from moray_surgeon.engine.extract import extract_function
+from moray_surgeon.engine.import_manager import add_import, remove_import
 from moray_surgeon.engine.rename import rename_symbol
 from moray_surgeon.engine.replace_call import replace_call
 from moray_surgeon.engine.type_hints import add_type_hints
@@ -29,29 +33,36 @@ from moray_surgeon.exceptions import (
     PathTraversalError,
 )
 from moray_surgeon.schema.instructions import (
+    AddImport,
     AddTypeHints,
     ExtractFunction,
     Instruction,
     Noop,
     RefactorPlan,
+    RemoveImport,
     RenameSymbol,
     ReplaceCall,
 )
 
 
 def execute_plan(plan: RefactorPlan, repo_root: Path) -> list[str]:
-    """Execute every instruction in order; raise on the first failure.
+    """Execute every instruction in dependency order; raise on the first failure.
 
     Args:
-        plan: A plan from the schema layer. Its ``instructions`` list is applied
-            verbatim; no reordering, deduplication or pre-validation happens here.
+        plan: A plan from the schema layer. Its ``instructions`` are first
+            topologically sorted on ``depends_on``; steps without dependencies
+            keep their authored order.
         repo_root: Directory every ``target_file`` is resolved against.
 
     Returns:
-        One human-readable log line per applied instruction. ``Noop`` entries are
-        reported as skipped and never count as changes.
+        One human-readable log line per applied instruction, in execution order.
+        ``Noop`` entries are reported as skipped and never count as changes. The
+        bracketed index is the execution position, not the position in the JSON.
 
     Raises:
+        DuplicateInstructionIdError: Two instructions share an id.
+        UnknownDependencyError: ``depends_on`` names an id that is not in the plan.
+        CircularDependencyError: The plan's dependency graph contains a cycle.
         PathTraversalError: ``target_file`` resolves outside ``repo_root``.
         FileNotFoundError: ``target_file`` is missing or not a regular file.
         InstructionError: An atom rejected the instruction input (e.g. an invalid
@@ -62,7 +73,7 @@ def execute_plan(plan: RefactorPlan, repo_root: Path) -> list[str]:
     root = repo_root.resolve()
     log: list[str] = []
 
-    for index, instruction in enumerate(plan.instructions):
+    for index, instruction in enumerate(topological_sort(plan.instructions)):
         if isinstance(instruction, Noop):
             log.append(f"[{index}] noop: skipped")
             continue
@@ -132,4 +143,8 @@ def _apply(instruction: Instruction, source: str, repo_root: Path) -> EditResult
         return replace_call(source, instruction.old_call, instruction.new_call)
     if isinstance(instruction, AddTypeHints):
         return add_type_hints(source, instruction.function_name)
+    if isinstance(instruction, AddImport):
+        return add_import(source, instruction.module, instruction.name, instruction.alias)
+    if isinstance(instruction, RemoveImport):
+        return remove_import(source, instruction.module, instruction.name)
     raise TypeError(f"unsupported instruction type: {type(instruction).__name__}")

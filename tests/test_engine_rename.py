@@ -75,6 +75,35 @@ def test_local_variable_rename_does_not_touch_other_files(tmp_path):
     assert result.changes == 2
 
 
+def test_rename_covers_more_files_than_jedis_default_parse_limit(tmp_path):
+    """Jedi stops project reference search after 30 parsed files.
+
+    The engine must raise that budget for the duration of the search; otherwise
+    a project with more than 30 modules silently keeps half of its references.
+    """
+    _write(tmp_path / "shared.py", "def target():\n    return 1\n")
+    modules = []
+    for index in range(32):
+        path = _write(
+            tmp_path / f"m{index:02d}.py",
+            "from shared import target\n"
+            "\n"
+            "\n"
+            f"def use_{index}():\n"
+            "    return target()\n",
+        )
+        modules.append(path)
+
+    result = rename_symbol(tmp_path, "shared.py", "target", "renamed")
+
+    assert result.changes == 65
+    for path in modules:
+        text = _read(path)
+        assert "from shared import renamed" in text
+        assert "return renamed()" in text
+        assert "target" not in text.replace("target_file", "")
+
+
 def test_rename_class_leaves_attributes_and_kwargs_alone(tmp_path):
     source = (
         "class User:\n"
@@ -202,14 +231,21 @@ def test_edit_result_is_frozen() -> None:
 
 
 def test_engine_package_exposes_the_atoms_and_dispatcher() -> None:
-    """The package re-exports the four atoms, the repo map and the executor."""
+    """The package re-exports every atom, the repo map and the executor."""
     assert set(engine_package.__all__) == {
+        "add_import",
         "add_type_hints",
         "execute_plan",
         "extract_function",
         "generate_repo_map",
+        "get_ast_fingerprint",
+        "remove_import",
         "rename_symbol",
         "replace_call",
+        "snapshot_repository",
+        "topological_sort",
+        "verify_repository_scope",
+        "verify_scope",
     }
     for name in engine_package.__all__:
         assert callable(getattr(engine_package, name))

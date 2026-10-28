@@ -100,7 +100,9 @@ def _init_repo(tmp_path: Path, test_source: str) -> Path:
 def _rename_plan_json() -> str:
     plan = RefactorPlan(
         instructions=[
-            RenameSymbol(target_file="src/app.py", old_name="old_name", new_name="new_name")
+            RenameSymbol(
+                id="s1", target_file="src/app.py", old_name="old_name", new_name="new_name"
+            )
         ],
         summary="rename helper",
     )
@@ -153,7 +155,7 @@ def test_execute_plan_reports_non_git_repo(tmp_path):
 
 
 def test_execute_plan_reports_noop_plan(tmp_path):
-    plan = RefactorPlan(instructions=[Noop(message="nothing to do")])
+    plan = RefactorPlan(instructions=[Noop(id="s2", message="nothing to do")])
 
     result = mcp_execute_plan(plan.model_dump_json(), str(tmp_path))
 
