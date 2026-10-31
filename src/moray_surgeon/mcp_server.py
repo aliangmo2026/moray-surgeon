@@ -67,6 +67,54 @@ parameterless function and insert a call where they were.
 Fields: `function_name`, `start_line`, `end_line` (1-based, start <= end).
 Only top-level statements can move.
 
+## extract_variable
+Extract the expression at an exact source range into a new variable:
+`variable_name = <expr>` is inserted before the containing statement and the
+range is rewritten to `variable_name`.
+Fields: `start_line`, `end_line` (1-based), `start_column`, `end_column`
+(0-based; the end points one past the expression's last character), and
+`variable_name`. The range must match exactly one whole expression; binding
+positions (assignment targets, keyword names, ...) are refused.
+
+## inline_variable
+Inline the single `variable_name = <expr>` assignment into every later read in
+its scope and delete the assignment. Only allowed in SSA form: assigned exactly
+once, never read before the assignment, never captured by a nested function or
+class, never read from another module, and no free name of `<expr>` may be
+rebound between the assignment and a read. Anything ambiguous is refused, not
+approximated.
+Fields: `variable_name`.
+
+## remove_dead_code
+Delete a top-level function or class that nothing in the project references.
+Deadness requires two independent proofs (Jedi references plus a name-resolution
+scan); any `__all__` entry, decorator, star import, or string literal that
+could be a dynamic `getattr` key vetoes the deletion.
+Fields: exactly one of `function_name` or `class_name`.
+
+## inline_function
+Inline a top-level single-`return` function into every same-file call site and
+delete the definition. Refuses recursion, multi-statement bodies, side
+effects used at more than one call site, `*args`/`**kwargs`, and any caller
+outside the file.
+Fields: `function_name`.
+
+## split_class
+Move receiver-free methods of one class into a new sibling class created right
+after it (decorators and docstrings travel). Refuses methods that use `self`,
+`cls` or `super()`.
+Fields: `class_name`, `methods_to_move` (list of method names), `new_class_name`.
+
+## move_symbol
+Move a top-level function or class from `source_file` to `target_file` (both
+must exist, must differ, and `target_file` must not already bind the name).
+Leading comments and the docstring travel with the node. `from <source> import
+<symbol>` statements in other modules are rewritten to the target module;
+relative imports keep their dots only when the rewritten statement still
+resolves to the target. Attribute-style usage, leftover references in the
+source, `__all__` exports and missing module-level dependencies refuse the move.
+Fields: `source_file`, `target_file`, `symbol_name`.
+
 ## add_type_hints
 Add `-> None` to functions that have no return annotation.
 Fields: `function_name` (string or null; null means the whole file).

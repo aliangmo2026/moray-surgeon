@@ -9,12 +9,15 @@ import pytest
 from rich.console import Console
 
 from moray_surgeon.intent import IntentParserError
-from moray_surgeon.orchestrator import Orchestrator
-from moray_surgeon.schema import Noop, RefactorPlan, RenameSymbol
+from moray_surgeon.orchestrator import Orchestrator, _failing_test_files
+from moray_surgeon.schema import Noop, RefactorPlan, RenameSymbol, ReplaceCall, SplitClass
 from moray_surgeon.ui import LiveTrace
-from moray_surgeon.verify import VerifyResult
+from moray_surgeon.verify import Verifier, VerifyResult
 
 _ORIGINAL = "def old_name():\n    return old_name()\n"
+# The hint sentence the orchestrator must inject (full-width colon and all);
+# built with chr() so the tests never spell the ambiguous punctuation themselves.
+_TEST_REPAIR_HINT_SENTENCE = "注意" + chr(0xFF1A) + "测试代码也需要被重构"
 
 _GIT_ENV = {
     "GIT_AUTHOR_NAME": "Moray Test",
@@ -278,6 +281,7 @@ def test_trace_reports_success_sequence(tmp_path):
         ("step", "Requesting plan from LLM..."),
         ("success", "Plan received."),
         ("step", "Recording AST scope fingerprints..."),
+        ("step", "Recording architecture snapshot (moray-scribe)..."),
         ("step", "Applying AST instructions..."),
         ("success", "Plan applied. Modified 1 file(s)."),
         ("step", "Running verification (ruff, mypy, pytest)..."),
@@ -301,6 +305,7 @@ def test_trace_reports_rollback_then_retry(tmp_path):
         ("step", "Requesting plan from LLM..."),
         ("success", "Plan received."),
         ("step", "Recording AST scope fingerprints..."),
+        ("step", "Recording architecture snapshot (moray-scribe)..."),
         ("step", "Applying AST instructions..."),
         ("success", "Plan applied. Modified 1 file(s)."),
         ("step", "Running verification (ruff, mypy, pytest)..."),
@@ -309,6 +314,7 @@ def test_trace_reports_rollback_then_retry(tmp_path):
         ("step", "Requesting plan from LLM..."),
         ("success", "Plan received."),
         ("step", "Recording AST scope fingerprints..."),
+        ("step", "Recording architecture snapshot (moray-scribe)..."),
         ("step", "Applying AST instructions..."),
         ("success", "Plan applied. Modified 1 file(s)."),
         ("step", "Running verification (ruff, mypy, pytest)..."),
@@ -331,6 +337,61 @@ def test_live_trace_renders_attempt_prefixed_lines():
     assert "Verification passed! Commit created." in text
     assert "Test failed! Rollback initiated." in text
     assert "Retrying with error context + code diff..." in text
+
+
+def test_show_report_prints_architecture_change(monkeypatch):
+    """The 架构变更 summary and its detail render after a successful run."""
+    from moray_surgeon import ui
+    from moray_surgeon.orchestrator import RefactorReport
+    from moray_surgeon.schema import RefactorPlan
+
+    # Full-width punctuation is built with chr() so the tests never spell the
+    # ambiguous characters RUF001 would flag.
+    summary = (
+        "架构变更" + chr(0xFF1A) + "新增 1 个类" + chr(0xFF0C) + "移动了 1 个函数"
+    )
+    added_line = "  + 类 MathOps" + chr(0xFF08) + "app" + chr(0xFF09)
+    moved_line = "  " + chr(0x2192) + " scale: app -> app.MathOps"
+    console = Console(record=True, width=120)
+    monkeypatch.setattr(ui, "console", console)
+    report = RefactorReport(
+        success=True,
+        attempts=1,
+        plan=RefactorPlan(),
+        log=["[0] split_class: 2 change(s) in app.py"],
+        last_verify=None,
+        architecture_diff=(
+            summary + "\n\n新增符号:\n" + added_line + "\n移动符号:\n" + moved_line + "\n"
+        ),
+    )
+
+    ui.show_report(report)
+
+    text = console.export_text()
+    assert summary in text
+    assert added_line in text
+    assert moved_line in text
+
+
+def test_show_report_silent_without_architecture_change(monkeypatch):
+    """No architecture section renders when the diff is empty."""
+    from moray_surgeon import ui
+    from moray_surgeon.orchestrator import RefactorReport
+    from moray_surgeon.schema import RefactorPlan
+
+    console = Console(record=True, width=120)
+    monkeypatch.setattr(ui, "console", console)
+    report = RefactorReport(
+        success=True,
+        attempts=1,
+        plan=RefactorPlan(),
+        log=["[0] rename_symbol: 1 change(s) in app.py"],
+        last_verify=None,
+    )
+
+    ui.show_report(report)
+
+    assert "架构变更" not in console.export_text()
 
 
 def test_live_trace_for_attempt_switches_prefix():
@@ -514,3 +575,393 @@ def test_scope_guard_can_be_disabled_explicitly(tmp_path, monkeypatch):
     assert report.success is True
     assert report.attempts == 1
     assert "return 999" in _read(repo / "app.py")
+
+
+# --------------------------------------------------------------------------
+# Test-repair hint: a pytest failure naming files under tests/ must tell the
+# model, explicitly, to send AST instructions for the test code.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        pytest.param(
+            VerifyResult(
+                ok=False,
+                stage="pytest",
+                stdout=(
+                    "FAILED tests/test_app.py::test_fetch_data - NameError: name "
+                    "'load_data' is not defined\n1 failed in 0.02s\n"
+                ),
+            ),
+            ["tests/test_app.py"],
+            id="summary-line",
+        ),
+        pytest.param(
+            VerifyResult(
+                ok=False, stage="pytest", stdout="tests/test_app.py:4: NameError\n1 failed"
+            ),
+            ["tests/test_app.py"],
+            id="short-traceback",
+        ),
+        pytest.param(
+            VerifyResult(
+                ok=False,
+                stage="pytest",
+                stdout="ERROR collecting tests/test_app.py\nImportError: cannot import name",
+                stderr="ImportError while importing test module 'tests/test_app.py'.",
+            ),
+            ["tests/test_app.py"],
+            id="collection-error-deduplicated",
+        ),
+        pytest.param(
+            VerifyResult(
+                ok=False,
+                stage="pytest",
+                stdout="C:" + chr(92) + "repo" + chr(92) + "tests"
+                + chr(92) + "test_old.py:5: AssertionError",
+            ),
+            ["tests/test_old.py"],
+            id="windows-absolute-traceback",
+        ),
+        pytest.param(
+            VerifyResult(
+                ok=False,
+                stage="pytest",
+                stdout="FAILED tests/test_a.py::x\nFAILED tests/test_b.py::y\n",
+            ),
+            ["tests/test_a.py", "tests/test_b.py"],
+            id="several-files-sorted",
+        ),
+        pytest.param(
+            VerifyResult(ok=False, stage="pytest", stdout="FAILED subtests/test_x.py::x\n"),
+            [],
+            id="lookalike-directory-not-matched",
+        ),
+        pytest.param(
+            VerifyResult(
+                ok=False,
+                stage="pytest",
+                stdout="rootdir: C:" + chr(92) + "repo" + chr(92) + "tests"
+                "\nconfigfile: pytest.ini\ncollected 0 items\n",
+            ),
+            [],
+            id="rootdir-noise-not-matched",
+        ),
+        pytest.param(
+            VerifyResult(ok=False, stage="mypy", stdout="tests/test_app.py:4: error: Name"),
+            [],
+            id="mypy-stage-never-hints",
+        ),
+        pytest.param(
+            VerifyResult(ok=False, stage="scope", stdout="tests/test_app.py exploded"),
+            [],
+            id="scope-stage-never-hints",
+        ),
+        pytest.param(
+            VerifyResult(ok=True, stage="all", stdout="tests/test_app.py passed"),
+            [],
+            id="green-run-never-hints",
+        ),
+    ],
+)
+def test_failing_test_files_detection(result, expected):
+    """Only a red pytest gate that names tests/ files produces the repair list."""
+    assert _failing_test_files(result) == expected
+
+
+def test_pytest_failure_in_tests_dir_adds_the_repair_hint(tmp_path):
+    repo = _init_repo(tmp_path)
+    parser = FakeParser([_rename_plan()])
+    verifier = FakeVerifier(
+        [
+            VerifyResult(
+                ok=False,
+                stage="pytest",
+                stdout=(
+                    "FAILED tests/test_ok.py::test_old_name - NameError: name "
+                    "'new_name' is not defined\n1 failed in 0.01s\n"
+                ),
+            ),
+            _ok(),
+        ]
+    )
+
+    Orchestrator(parser, verifier).run("rename old_name", repo, context="house style")
+
+    repair = parser.contexts[1]
+    assert "house style" in repair
+    assert "Previous attempt failed verification" in repair
+    assert _TEST_REPAIR_HINT_SENTENCE in repair
+    assert "- tests/test_ok.py" in repair
+    assert "rename_symbol or replace_call" in repair
+    # The hint is an addition: the plain failure feedback is still complete.
+    assert "Verification error:" in repair
+    assert "diff --git" in repair
+
+
+def test_pytest_failure_outside_tests_gets_no_hint(tmp_path):
+    repo = _init_repo(tmp_path)
+    parser = FakeParser([_rename_plan()])
+    verifier = FakeVerifier(
+        [
+            VerifyResult(
+                ok=False,
+                stage="pytest",
+                stdout="app.py:1: error in production code\nFAILED app-only check",
+            ),
+            _ok(),
+        ]
+    )
+
+    Orchestrator(parser, verifier).run("rename old_name", repo)
+
+    assert "测试代码也需要被重构" not in parser.contexts[1]
+    assert "Previous attempt failed verification" in parser.contexts[1]
+
+
+# --------------------------------------------------------------------------
+# End-to-end: source and tests are strongly bound, the source edit breaks the
+# tests, and the second round repairs the test module with a real AST edit and
+# a real pytest gate.
+# --------------------------------------------------------------------------
+
+
+_BOUND_SOURCE = "def fetch_data():\n    return 1\n"
+# The star import is the classic tight coupling: pytest resolves the bare name
+# at runtime, while ruff's default rule set stays silent about it — so a
+# mismatch between the test and the source surfaces at the pytest gate, exactly
+# where the test-repair hint lives.
+_BOUND_TEST = "from app import *\n\n\ndef test_fetch_data():\n    assert fetch_data() == 1\n"
+
+
+def _test_callee_plan() -> RefactorPlan:
+    """A partial plan: the test's callee is renamed, the source is not."""
+    return RefactorPlan(
+        instructions=[
+            ReplaceCall(
+                id="s1",
+                target_file="tests/test_app.py",
+                old_call="fetch_data",
+                new_call="load_data",
+            )
+        ]
+    )
+
+
+def _source_rename_plan() -> RefactorPlan:
+    """Rename the source symbol; Jedi propagates it into the star-importing test."""
+    return RefactorPlan(
+        instructions=[
+            RenameSymbol(
+                id="s1", target_file="app.py", old_name="fetch_data", new_name="load_data"
+            )
+        ]
+    )
+
+
+def _bound_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _write(repo / "app.py", _BOUND_SOURCE)
+    _write(repo / "conftest.py", "")
+    _write(repo / "tests" / "test_app.py", _BOUND_TEST)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    return repo
+
+
+def test_broken_test_is_repaired_in_the_next_round(tmp_path):
+    """A test-only rename breaks the suite; the hinted second round repairs it.
+
+    Round one renames the callee inside the test module but not in the source,
+    so pytest fails with a NameError inside tests/test_app.py. The repair
+    feedback names the test file and demands test-code edits. The second plan —
+    replanned from a clean HEAD — renames the source symbol; Jedi's project-wide
+    rename propagates through the star import into the test module, and the
+    suite turns green.
+    """
+    repo = _bound_repo(tmp_path)
+    parser = FakeParser([_test_callee_plan(), _source_rename_plan()])
+    verifier = Verifier(repo, mypy_target="app.py", pytest_args=["-q", "tests"])
+
+    report = Orchestrator(parser, verifier).run(
+        "rename fetch_data to load_data everywhere, including the tests", repo
+    )
+
+    assert report.success is True
+    assert report.attempts == 2
+    assert _read(repo / "app.py") == "def load_data():\n    return 1\n"
+    assert _read(repo / "tests" / "test_app.py") == (
+        "from app import *\n\n\ndef test_fetch_data():\n    assert load_data() == 1\n"
+    )
+    # The feedback named the broken test file and demanded test-code edits.
+    assert _TEST_REPAIR_HINT_SENTENCE in parser.contexts[1]
+    assert "tests/test_app.py" in parser.contexts[1]
+    # The failed round rolled back; only the base and the fixed round committed.
+    assert _git(repo, "status", "--porcelain").stdout == ""
+    assert _commit_count(repo) == 2
+
+
+def test_unrepairable_test_failure_exhausts_attempts(tmp_path):
+    repo = _bound_repo(tmp_path)
+    # Every round repeats the test-only rename: the source never catches up,
+    # the suite stays red, and every retry context carries the hint.
+    parser = FakeParser([_test_callee_plan()])
+    verifier = Verifier(repo, mypy_target="app.py", pytest_args=["-q", "tests"])
+
+    report = Orchestrator(parser, verifier, max_attempts=2).run(
+        "rename fetch_data to load_data", repo
+    )
+
+    assert report.success is False
+    assert report.attempts == 2
+    assert report.last_verify is not None and report.last_verify.stage == "pytest"
+    assert _TEST_REPAIR_HINT_SENTENCE in parser.contexts[1]
+    # Everything rolled back to the committed baseline.
+    assert _read(repo / "app.py") == _BOUND_SOURCE
+    assert _read(repo / "tests" / "test_app.py") == _BOUND_TEST
+    assert _git(repo, "status", "--porcelain").stdout == ""
+    assert _commit_count(repo) == 1
+
+
+# --------------------------------------------------------------------------
+# Architecture before/after snapshots (moray-scribe).
+# --------------------------------------------------------------------------
+
+
+def _snapshot(nodes: list[tuple[str, str, str, str]]) -> str:
+    """A canned moray-scribe snapshot in the architecture module's shape."""
+    import json
+
+    return json.dumps(
+        {
+            "nodes": [
+                {"id": node_id, "kind": kind, "name": name, "module": module}
+                for node_id, kind, name, module in nodes
+            ],
+            "edges": [],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def test_architecture_diff_captured_on_success(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    before = _snapshot([("app.build", "function", "build", "app")])
+    after = _snapshot(
+        [
+            ("app.build", "function", "build", "app"),
+            ("app.Widget", "class", "Widget", "app"),
+        ]
+    )
+    captures = iter([before, after])
+    monkeypatch.setattr(
+        "moray_surgeon.orchestrator.capture_architecture", lambda root: next(captures)
+    )
+    parser = FakeParser([_rename_plan()])
+    verifier = FakeVerifier([_ok()])
+
+    report = Orchestrator(parser, verifier).run("rename old_name", repo)
+
+    assert report.success is True
+    assert "架构变更" in report.architecture_diff
+    assert "Widget" in report.architecture_diff
+
+
+def test_architecture_diff_empty_when_structure_unchanged(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    same = _snapshot([("app.build", "function", "build", "app")])
+    monkeypatch.setattr("moray_surgeon.orchestrator.capture_architecture", lambda root: same)
+
+    report = Orchestrator(FakeParser([_rename_plan()]), FakeVerifier([_ok()])).run(
+        "rename old_name", repo
+    )
+
+    assert report.success is True
+    assert report.architecture_diff == ""
+
+
+def test_architecture_capture_failure_degrades_gracefully(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+
+    def explode(root):
+        raise RuntimeError("scribe exploded")
+
+    monkeypatch.setattr("moray_surgeon.orchestrator.capture_architecture", explode)
+
+    report = Orchestrator(FakeParser([_rename_plan()]), FakeVerifier([_ok()])).run(
+        "rename old_name", repo
+    )
+
+    # The lens must never break the refactor.
+    assert report.success is True
+    assert report.architecture_diff == ""
+
+
+def test_architecture_diff_empty_on_failure(tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path)
+    before = _snapshot([("app.build", "function", "build", "app")])
+    after = _snapshot(
+        [
+            ("app.build", "function", "build", "app"),
+            ("app.Widget", "class", "Widget", "app"),
+        ]
+    )
+    captures = iter([before, after])
+    monkeypatch.setattr(
+        "moray_surgeon.orchestrator.capture_architecture",
+        lambda root: next(captures, before),
+    )
+
+    report = Orchestrator(FakeParser([_rename_plan()]), FakeVerifier([_failed("boom")])).run(
+        "rename old_name", repo
+    )
+
+    # Rolled back: no architecture change is reported.
+    assert report.success is False
+    assert report.architecture_diff == ""
+
+
+def test_architecture_diff_from_real_scribe(tmp_path):
+    """With scribe installed, a class split produces a real architecture diff."""
+    pytest.importorskip("moray_scribe")
+    repo = _init_repo(tmp_path)
+    _write(
+        repo / "app.py",
+        "class Math:\n"
+        "    def scale(self, x):\n"
+        "        return x * 2\n"
+        "\n"
+        "\n"
+        "def helper():\n"
+        "    return 1\n",
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "math")
+    parser = FakeParser(
+        [
+            RefactorPlan(
+                instructions=[
+                    SplitClass(
+                        id="s1",
+                        target_file="app.py",
+                        class_name="Math",
+                        methods_to_move=["scale"],
+                        new_class_name="MathOps",
+                    )
+                ]
+            )
+        ]
+    )
+
+    report = Orchestrator(parser, FakeVerifier([_ok()]), scope_guard=False).run(
+        "split Math", repo
+    )
+
+    assert report.success is True
+    assert "架构变更" in report.architecture_diff
+    assert "MathOps" in report.architecture_diff

@@ -32,7 +32,7 @@
 
 Ask a general-purpose coding agent to rename one function and it usually rewrites the whole file. What comes back compiles often enough to feel safe: new formatting, a dropped import, an unrelated line quietly changed. Tests catch some of it. Code review catches the rest. The trust budget does not survive the third time.
 
-moray-surgeon removes the model from the editing path. The LLM compiles natural language into a JSON plan of seven typed operations; a deterministic AST engine applies it. The model never returns a file body or a statement suite: even imports are expressed as a module path plus identifiers, and the only expression-shaped field is `replace_call.new_call`, which must parse as a single Python expression and can only replace a callee. A hallucinated file has no slot to arrive in.
+moray-surgeon removes the model from the editing path. The LLM compiles natural language into a JSON plan of thirteen typed operations; a deterministic AST engine applies it. The model never returns a file body or a statement suite: even imports are expressed as a module path plus identifiers, and the only expression-shaped field is `replace_call.new_call`, which must parse as a single Python expression and can only replace a callee. A hallucinated file has no slot to arrive in.
 
 That is what *zero-hallucination* means here: the model cannot invent code structure. It can still choose the wrong operation — which is why every attempt ends at **two** gates, not one: the verification gates (`ruff`/`mypy`/`pytest`) and an AST scope guard that proves no function, class or module-level statement outside the plan was touched. Either gate rolls the whole attempt back.
 
@@ -71,6 +71,7 @@ moray-surgeon 是一个「零幻觉」代码重构引擎：大模型只负责把
 - 🧪 **Dry run.** `--dry-run` applies the plan inside the transaction, prints a syntax-highlighted unified diff, and rolls back without verifying or committing.
 - 🚦 **CI gateway.** `moray-surgeon audit` is the read-only counterpart of the refactor loop: it diffs the working tree against a base ref, re-fingerprints every changed Python file, applies the same scope gate when a plan is supplied, and runs `ruff`/`mypy`/`pytest` — then exits non-zero with a JSON report. No edit, no commit, no stash.
 - 💥 **Proven under load.** An 8,046-line, 300-class synthetic project survived a 50-instruction single-transaction refactor; two poisoned-instruction runs rolled back in under 0.1 s. [Full report with diffs and timings](./docs/STRESS_TEST_REPORT.md).
+- 🏛️ **Architecture before/after.** On success the orchestrator takes two moray-scribe symbol-graph snapshots (before the plan, after the gates) and stores a structural comparison in `RefactorReport.architecture_diff` — extracted classes, functions that moved across modules, removed symbols. The CLI prints a one-line 架构变更 summary with the detail. Requires the local moray-scribe checkout (`pip install -e ../moray-scribe` or the `scribe` extra); without it the feature degrades to an empty diff and never blocks a refactor.
 
 ### Instruction set
 
@@ -78,6 +79,12 @@ moray-surgeon 是一个「零幻觉」代码重构引擎：大模型只负责把
 |---|---|---|
 | `rename_symbol` | Rename a symbol and every Jedi-resolved reference | Project-wide, cross-file |
 | `extract_function` | Move a line range into a new parameterless function and insert the call | Module top level only |
+| `extract_variable` | Hoist the expression at an exact source range into `name = <expr>` | Single file; refuses binding positions and scope/iteration boundaries |
+| `inline_variable` | Replace every read of an SSA variable with its value and delete the assignment | Single file; refuses reassignment, closures, cross-file reads |
+| `inline_function` | Inline a single-return function into every call site and delete it | Same file only; refuses recursion and duplicated side effects |
+| `split_class` | Move receiver-free methods into a new sibling class | Same file; refuses `self`/`cls`/`super()` methods |
+| `remove_dead_code` | Delete an unreferenced top-level function or class | Project-wide proof; refuses `__all__`, decorators, dynamic strings |
+| `move_symbol` | Move a top-level function/class to another file and rewrite imports | Cross-file; refuses ambiguous or unsafe imports |
 | `replace_call` | Swap the callee of matching calls | Arguments and layout preserved |
 | `add_type_hints` | Add a missing `-> None` return annotation | Conservative by design |
 | `add_import` | Add `import x` / `from x import y`, sorted into the import block | Module level, absolute modules |
@@ -279,6 +286,45 @@ Then ask Cursor:
 The same `mcpServers` block works for Claude Desktop's `claude_desktop_config.json`. If the executable is not on `PATH` (common when Cursor does not inherit your virtualenv), point `command` at the venv script: `.venv/bin/moray-surgeon` on macOS/Linux, `.venv\Scripts\moray-surgeon.exe` on Windows.
 
 Two operational notes: the MCP tools do not build a code map, so name the files and symbols in the intent; and they use the default verification profile (`mypy src`, `pytest -q`). For a repository without a `src/` directory, use the CLI, where `--mypy-target` and `--pytest-args` are configurable.
+
+## Deploy as a Cloud Skill
+
+Platforms like WorkBuddy accept a Serverless code package instead of a long-running service. `scripts/build_skill.py` builds one:
+
+```bash
+python scripts/build_skill.py
+```
+
+It stages a temporary directory (the `moray_surgeon/` package without `tests/` or `__pycache__`, a `requirements.txt` with the runtime dependencies, `pyproject.toml`/`LICENSE`/`README.md`, a `handler.py` shim, and the `SKILL.md` manifest the platform requires at the archive root), zips it into `moray-skill.zip` at the repository root, and fails with a non-zero exit code if the archive exceeds the 3 MB upload limit.
+
+Upload `moray-skill.zip` to WorkBuddy's skill/Serverless page and configure the handler as `handler.handler` (the shim re-exports `moray_surgeon.cloud_entry.handler`, so any platform that expects `handler.py` at the package root works out of the box).
+
+The handler accepts a JSON payload — either directly or inside an API-Gateway-style event `body` (base64 supported):
+
+```json
+{"action": "refactor", "repo_path": "/sandbox/repo", "intent": "把 parse_args 重命名为 parse_cli_options"}
+```
+
+| Field | Action | Meaning |
+|---|---|---|
+| `action` | both | `refactor` or `audit` |
+| `repo_path` | both | Git repository root reachable **from the sandbox** |
+| `intent` | `refactor` | Natural-language request |
+| `dry_run` | `refactor` | Capture the diff and roll back instead of committing |
+| `max_attempts` | `refactor` | Auto-fix rounds (default 3) |
+| `base_ref` | `audit` | Git revision to diff against (default `HEAD`) |
+
+Responses are always JSON: `{"statusCode", "headers", "body"}`, with `body.ok` / `body.error`. An unreachable `repo_path` (a local path on the caller's machine, a missing directory, or a non-Git folder) is caught and returned as a friendly `400` explaining that the path must be reachable inside the cloud sandbox — never as a crash.
+
+The model endpoint is configured only through deployment environment variables, never through the request payload (so an untrusted request cannot aim the server at an arbitrary URL):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MORAY_API_TYPE` | `ollama` | `ollama`, `openai` or `anthropic` dialect |
+| `MORAY_MODEL` | `qwen2.5-coder:7b` | Model name |
+| `MORAY_BASE_URL` | `http://localhost:11434` | API root (http/https only; credentials and query strings are rejected) |
+| `MORAY_API_KEY` | unset | Bearer/x-api-key credential for the cloud dialects |
+| `MORAY_TIMEOUT` | `120` | Per-request timeout in seconds |
 
 ## Use as a CI Gateway
 

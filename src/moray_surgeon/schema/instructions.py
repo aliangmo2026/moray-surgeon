@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from moray_surgeon.schema.exceptions import CircularSchemaError, SchemaInlineError
 
@@ -103,6 +103,185 @@ class ExtractFunction(_FileInstruction):
     end_line: int = Field(ge=1)
 
 
+class ExtractVariable(_FileInstruction):
+    """Extract the expression at an exact source range into a new variable.
+
+    The engine locates the unique expression node occupying the range and
+    rewrites it to ``variable_name`` while inserting
+    ``variable_name = <expression>`` on its own line just before the statement
+    that contains the range.
+
+    Coordinates follow libcst's ``PositionProvider``: lines are 1-based,
+    columns are 0-based, and the end coordinates point *one past* the
+    expression's last character (exclusive, like editor selection ranges).
+    NOTE: ordering of the four coordinates is enforced by the engine layer,
+    not here.
+    """
+
+    action: Literal["extract_variable"] = "extract_variable"
+    start_line: int = Field(ge=1)
+    start_column: int = Field(ge=0)
+    end_line: int = Field(ge=1)
+    end_column: int = Field(ge=0)
+    variable_name: str
+
+    @field_validator("variable_name")
+    @classmethod
+    def _validate_variable_name(cls, value: str) -> str:
+        """The generated assignment must be syntactically valid."""
+        return _validate_required_identifier(value)
+
+
+class InlineVariable(_FileInstruction):
+    """Inline the single assignment of ``variable_name`` into every reference.
+
+    The engine requires the variable to be bound exactly once in its scope
+    (SSA form), read only after that assignment, never captured by a nested
+    function/class, and never referenced from another module. Anything else is
+    refused with ``ValueError`` instead of producing a semantic change.
+    """
+
+    action: Literal["inline_variable"] = "inline_variable"
+    variable_name: str
+
+    @field_validator("variable_name")
+    @classmethod
+    def _validate_variable_name(cls, value: str) -> str:
+        """The lookup target must be a real Python identifier."""
+        return _validate_required_identifier(value)
+
+
+class RemoveDeadCode(_FileInstruction):
+    """Delete a top-level function or class that nothing references.
+
+    Identify the dead symbol with exactly one of ``function_name`` or
+    ``class_name``. The engine confirms project-wide deadness with Jedi and
+    refuses on any doubt: any reference, any ``__all__`` entry, any string
+    literal that could be a dynamic ``getattr`` key, any decorator on the
+    symbol, any star import of its module.
+    """
+
+    action: Literal["remove_dead_code"] = "remove_dead_code"
+    function_name: str | None = None
+    class_name: str | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_name(self) -> RemoveDeadCode:
+        """Both names (or neither) is an ambiguous instruction: refuse."""
+        if (self.function_name is None) == (self.class_name is None):
+            raise ValueError("exactly one of function_name or class_name is required")
+        name = self.function_name or self.class_name
+        assert name is not None
+        _validate_required_identifier(name)
+        return self
+
+    @property
+    def symbol_name(self) -> str:
+        """The name of the symbol slated for deletion."""
+        return self.function_name or self.class_name  # type: ignore[return-value]
+
+
+class MoveSymbol(_BaseInstruction):
+    """Move a top-level function or class from one file to another.
+
+    The node (with its leading comments and docstring) is appended to
+    ``target_file`` and deleted from ``source_file``. ``from <source> import
+    <symbol>`` statements in other in-repo modules are rewritten to import from
+    the target module; anything the engine cannot prove safe — relative imports
+    crossing directories, attribute-style usage, leftover references in the
+    source file itself — refuses the whole move.
+    """
+
+    action: Literal["move_symbol"] = "move_symbol"
+    source_file: str
+    target_file: str
+    symbol_name: str
+
+    @field_validator("source_file", "target_file")
+    @classmethod
+    def _validate_files(cls, value: str) -> str:
+        """Both endpoints obey the same rules as every other target_file."""
+        path = Path(value)
+        if path.suffix != ".py":
+            raise ValueError("source_file and target_file must end with .py")
+        if ".." in path.parts:
+            raise ValueError("source_file and target_file must not contain '..'")
+        if path.anchor:
+            raise ValueError("source_file and target_file must be relative and drive-less")
+        return path.as_posix()
+
+    @field_validator("symbol_name")
+    @classmethod
+    def _validate_symbol_name(cls, value: str) -> str:
+        """Only a real identifier can be a top-level definition."""
+        return _validate_required_identifier(value)
+
+    @model_validator(mode="after")
+    def _files_must_differ(self) -> MoveSymbol:
+        """Moving a symbol onto its own file is a no-op at best."""
+        if self.source_file == self.target_file:
+            raise ValueError("source_file and target_file must be different files")
+        return self
+
+
+class InlineFunction(_FileInstruction):
+    """Inline a single-return function into every same-module call site.
+
+    The engine requires the function to be a unique top-level ``def`` whose
+    body is exactly one ``return <expr>``; the expression's parameters are
+    substituted with the caller's arguments at every call site and the
+    definition is deleted. Anything ambiguous — recursion, side-effecting
+    bodies used more than once, parameters used twice with impure arguments,
+    callers outside the file — refuses the inline.
+    """
+
+    action: Literal["inline_function"] = "inline_function"
+    function_name: str
+
+    @field_validator("function_name")
+    @classmethod
+    def _validate_function_name(cls, value: str) -> str:
+        """The lookup target must be a real Python identifier."""
+        return _validate_required_identifier(value)
+
+
+class SplitClass(_FileInstruction):
+    """Move methods of one class into a new sibling class.
+
+    For this iteration the moved methods must not touch their receiver at all:
+    any ``self`` / ``cls`` usage (or ``super()``) refuses the split, so only
+    state-free methods can move. Instance-state migration is future work.
+    """
+
+    action: Literal["split_class"] = "split_class"
+    class_name: str
+    methods_to_move: list[str] = Field(min_length=1)
+    new_class_name: str
+
+    @field_validator("class_name", "new_class_name")
+    @classmethod
+    def _validate_class_names(cls, value: str) -> str:
+        """Both class names must be real Python identifiers."""
+        return _validate_required_identifier(value)
+
+    @field_validator("methods_to_move")
+    @classmethod
+    def _validate_method_names(cls, value: list[str]) -> list[str]:
+        """Every method name must be an identifier and the list must be unique."""
+        for name in value:
+            _validate_required_identifier(name)
+        if len(set(value)) != len(value):
+            raise ValueError("methods_to_move must not repeat a method name")
+        return value
+
+    @model_validator(mode="after")
+    def _classes_must_differ(self) -> SplitClass:
+        """Splitting a class onto itself is a no-op at best."""
+        if self.new_class_name == self.class_name:
+            raise ValueError("new_class_name must differ from class_name")
+        return self
+
+
 class AddTypeHints(_FileInstruction):
     """Add type hints to one function, or to the whole file if function_name is None."""
 
@@ -184,6 +363,11 @@ def _validate_optional_identifier(value: str | None) -> str | None:
     """Validate an optional identifier; None passes through untouched."""
     if value is None:
         return None
+    return _validate_required_identifier(value)
+
+
+def _validate_required_identifier(value: str) -> str:
+    """Validate a mandatory identifier; None never passes through."""
     if not value.isidentifier() or keyword.iskeyword(value):
         raise ValueError(f"expected a Python identifier, got {value!r}")
     return value
@@ -199,6 +383,12 @@ class Noop(_BaseInstruction):
 Instruction = Annotated[
     RenameSymbol
     | ExtractFunction
+    | ExtractVariable
+    | InlineVariable
+    | InlineFunction
+    | SplitClass
+    | RemoveDeadCode
+    | MoveSymbol
     | AddTypeHints
     | ReplaceCall
     | AddImport

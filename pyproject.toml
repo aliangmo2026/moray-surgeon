@@ -29,6 +29,12 @@ dev = [
     "ruff>=0.5",
     "mypy>=1.10",
 ]
+# Architecture before/after snapshots are powered by the local moray-scribe
+# checkout (pip install -e ../moray-scribe). The orchestrator degrades to an
+# empty architecture diff when the package is absent.
+scribe = [
+    "moray-scribe>=0.1.0",
+]
 
 [project.scripts]
 moray-surgeon = "moray_surgeon.cli:app"
@@ -54,6 +60,12 @@ python_version = "3.11"
 module = "jedi"
 ignore_missing_imports = true
 
+# moray-scribe (the local architecture-snapshot engine) ships no py.typed
+# marker either; the architecture module wraps its API behind typed helpers.
+[[tool.mypy.overrides]]
+module = "moray_scribe.*"
+ignore_missing_imports = true
+
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "ANN", "B", "SIM", "RUF"]
 
@@ -64,6 +76,9 @@ select = ["E", "F", "W", "I", "N", "UP", "ANN", "B", "SIM", "RUF"]
 # Typer's declarative API takes Option/Argument objects as parameter defaults;
 # B008 exists to prevent exactly that pattern elsewhere.
 "src/moray_surgeon/cli.py" = ["B008"]
+# build_skill.py embeds the Chinese SKILL.md manifest verbatim; its full-width
+# punctuation and long table rows are the deliverable, not style violations.
+"scripts/*" = ["RUF001", "E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

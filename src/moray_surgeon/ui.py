@@ -70,11 +70,27 @@ def show_report(report: RefactorReport) -> None:
         console.print(f"[green]✔[/green] refactor succeeded in {report.attempts} attempt(s)")
         for line in report.log:
             console.print(line, markup=False)
+        show_architecture(report.architecture_diff)
         return
 
     console.print("[red]✘[/red] refactor failed; workspace rolled back")
     if report.last_verify is not None:
         console.print(report.last_verify.feedback(), markup=False)
+
+
+def show_architecture(diff_text: str) -> None:
+    """Render the moray-scribe architecture comparison after a success.
+
+    The first line is the one-line Chinese summary; the rest lists the
+    added/moved/removed symbols. Nothing prints when the structure did not
+    change.
+    """
+    lines = diff_text.splitlines()
+    if not lines:
+        return
+    console.print(Text(lines[0], style="bold magenta"))
+    for line in lines[1:]:
+        console.print(line, markup=False, style="dim")
 
 
 class LiveTrace:

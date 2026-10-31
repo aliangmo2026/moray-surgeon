@@ -1,9 +1,9 @@
 """Execute a validated refactor plan against a repository, instruction by instruction.
 
 The dispatcher owns ordering, path containment and error classification. Most
-atoms are source-in / source-out; ``rename_symbol`` is project-aware (Jedi
-resolves references across files) and rewrites its affected files in place,
-inside the caller's transaction.
+atoms are source-in / source-out; ``rename_symbol`` and ``move_symbol`` are
+project-aware (Jedi resolves references across files) and rewrite their
+affected files in place, inside the caller's transaction.
 
 Invariants:
 
@@ -23,9 +23,15 @@ from pathlib import Path
 from moray_surgeon.engine.base import EditResult
 from moray_surgeon.engine.dag import topological_sort
 from moray_surgeon.engine.extract import extract_function
+from moray_surgeon.engine.extract_variable import extract_variable
 from moray_surgeon.engine.import_manager import add_import, remove_import
+from moray_surgeon.engine.inline_function import inline_function
+from moray_surgeon.engine.inline_variable import inline_variable
+from moray_surgeon.engine.move_symbol import move_symbol
+from moray_surgeon.engine.remove_dead_code import remove_dead_code
 from moray_surgeon.engine.rename import rename_symbol
 from moray_surgeon.engine.replace_call import replace_call
+from moray_surgeon.engine.split_class import split_class
 from moray_surgeon.engine.type_hints import add_type_hints
 from moray_surgeon.exceptions import (
     InstructionError,
@@ -36,12 +42,18 @@ from moray_surgeon.schema.instructions import (
     AddImport,
     AddTypeHints,
     ExtractFunction,
+    ExtractVariable,
+    InlineFunction,
+    InlineVariable,
     Instruction,
+    MoveSymbol,
     Noop,
     RefactorPlan,
+    RemoveDeadCode,
     RemoveImport,
     RenameSymbol,
     ReplaceCall,
+    SplitClass,
 )
 
 
@@ -78,10 +90,16 @@ def execute_plan(plan: RefactorPlan, repo_root: Path) -> list[str]:
             log.append(f"[{index}] noop: skipped")
             continue
 
+        if isinstance(instruction, MoveSymbol):
+            log.append(
+                _execute_move_symbol(instruction, index, root)
+            )
+            continue
+
         target = _resolve_target(instruction.target_file, root)
         source = target.read_text(encoding="utf-8")
         try:
-            result = _apply(instruction, source, root)
+            result = _apply(instruction, source, root, target)
         except ValueError as exc:
             raise InstructionError(
                 f"{instruction.action} failed for {instruction.target_file}: {exc}",
@@ -98,6 +116,33 @@ def execute_plan(plan: RefactorPlan, repo_root: Path) -> list[str]:
         log.append(f"[{index}] {instruction.action}: {result.changes} change(s) in {target.name}")
 
     return log
+
+
+def _execute_move_symbol(instruction: MoveSymbol, index: int, root: Path) -> str:
+    """Run the project-aware move atom; it writes every affected file itself.
+
+    Unlike the single-file atoms, a move touches the source, the target and
+    every importer file, so it manages its own writes inside the caller's
+    transaction (the same contract ``rename_symbol`` has).
+    """
+    source_path = _resolve_target(instruction.source_file, root)
+    target_path = _resolve_target(instruction.target_file, root)
+    try:
+        result = move_symbol(root, source_path, target_path, instruction.symbol_name)
+    except ValueError as exc:
+        raise InstructionError(
+            f"{instruction.action} failed for {instruction.source_file}: {exc}",
+            instruction_index=index,
+        ) from exc
+    if result.changes == 0:  # pragma: no cover - a move always changes both files
+        raise NoOpEditError(
+            f"instruction {index} ({instruction.action}) changed nothing in "
+            f"{instruction.source_file}"
+        )
+    return (
+        f"[{index}] {instruction.action}: {result.changes} change(s) "
+        f"({source_path.name} -> {target_path.name})"
+    )
 
 
 def _resolve_target(target_file: str, repo_root: Path) -> Path:
@@ -119,11 +164,15 @@ def _resolve_target(target_file: str, repo_root: Path) -> Path:
     return target
 
 
-def _apply(instruction: Instruction, source: str, repo_root: Path) -> EditResult:
+def _apply(instruction: Instruction, source: str, repo_root: Path, target: Path) -> EditResult:
     """Dispatch one non-noop instruction to its atomic engine operation.
 
-    ``rename_symbol`` needs the repository root for Jedi; the remaining atoms
-    consume the source the dispatcher already read.
+    ``rename_symbol``, ``inline_variable`` and ``remove_dead_code`` are
+    project-aware (Jedi resolves references across files) and need the
+    repository root plus the resolved target path; the remaining atoms consume
+    the source the dispatcher already read. ``MoveSymbol`` never reaches this
+    function: the dispatcher routes it to ``_execute_move_symbol`` because it
+    writes several files itself.
     """
     if isinstance(instruction, RenameSymbol):
         return rename_symbol(
@@ -139,6 +188,28 @@ def _apply(instruction: Instruction, source: str, repo_root: Path) -> EditResult
             instruction.start_line,
             instruction.end_line,
         )
+    if isinstance(instruction, ExtractVariable):
+        return extract_variable(
+            source,
+            instruction.start_line,
+            instruction.start_column,
+            instruction.end_line,
+            instruction.end_column,
+            instruction.variable_name,
+        )
+    if isinstance(instruction, InlineVariable):
+        return inline_variable(source, instruction.variable_name, repo_root, target)
+    if isinstance(instruction, InlineFunction):
+        return inline_function(source, instruction.function_name, repo_root, target)
+    if isinstance(instruction, SplitClass):
+        return split_class(
+            source,
+            instruction.class_name,
+            instruction.methods_to_move,
+            instruction.new_class_name,
+        )
+    if isinstance(instruction, RemoveDeadCode):
+        return remove_dead_code(source, instruction.symbol_name, repo_root, target)
     if isinstance(instruction, ReplaceCall):
         return replace_call(source, instruction.old_call, instruction.new_call)
     if isinstance(instruction, AddTypeHints):

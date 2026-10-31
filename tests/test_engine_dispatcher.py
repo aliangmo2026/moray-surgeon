@@ -18,12 +18,18 @@ from moray_surgeon.schema import (
     AddImport,
     AddTypeHints,
     ExtractFunction,
+    ExtractVariable,
+    InlineFunction,
+    InlineVariable,
     Instruction,
+    MoveSymbol,
     Noop,
     RefactorPlan,
+    RemoveDeadCode,
     RemoveImport,
     RenameSymbol,
     ReplaceCall,
+    SplitClass,
 )
 from moray_surgeon.schema import exceptions as schema_exceptions
 
@@ -493,3 +499,243 @@ def test_instruction_error_index_is_the_execution_position(tmp_path):
     # The rename is executed first, so the failing step is at execution index 1
     # even though it is authoring index 0.
     assert excinfo.value.instruction_index == 1
+
+
+def test_extract_variable_dispatch(tmp_path):
+    repo = tmp_path / "repo"
+    target = _write(repo / "app.py", "# price times count\nprint(price * count)\n")
+
+    log = execute_plan(
+        _plan(
+            ExtractVariable(
+                id="s1",
+                target_file="app.py",
+                start_line=2,
+                start_column=6,
+                end_line=2,
+                end_column=19,
+                variable_name="unit",
+            )
+        ),
+        repo,
+    )
+
+    assert _read(target) == "# price times count\nunit = price * count\nprint(unit)\n"
+    assert log == ["[0] extract_variable: 2 change(s) in app.py"]
+
+
+def test_inline_variable_dispatch(tmp_path):
+    repo = tmp_path / "repo"
+    target = _write(repo / "app.py", "total = price * count\nprint(total)\n")
+
+    log = execute_plan(
+        _plan(InlineVariable(id="s1", target_file="app.py", variable_name="total")),
+        repo,
+    )
+
+    assert _read(target) == "print((price * count))\n"
+    assert log == ["[0] inline_variable: 2 change(s) in app.py"]
+
+
+def test_extract_then_inline_round_trip(tmp_path):
+    """extract_variable hoists an expression; inlining it restores the reads."""
+    repo = tmp_path / "repo"
+    target = _write(repo / "app.py", "print(price * count)\n")
+    original = _read(target)
+
+    plan = _plan(
+        ExtractVariable(
+            id="extract",
+            target_file="app.py",
+            start_line=1,
+            start_column=6,
+            end_line=1,
+            end_column=19,
+            variable_name="total",
+        ),
+        InlineVariable(
+            id="inline",
+            target_file="app.py",
+            variable_name="total",
+            depends_on=["extract"],
+        ),
+    )
+    execute_plan(plan, repo)
+
+    # The inline reproduces the original expression, now with explicit grouping.
+    assert _read(target) == "print((price * count))\n"
+    assert original == "print(price * count)\n"
+
+
+def test_refused_inline_raises_instruction_error(tmp_path):
+    repo = tmp_path / "repo"
+    target = _write(repo / "app.py", "x = 1\nprint(x)\nx = 2\n")
+
+    plan = _plan(InlineVariable(id="s1", target_file="app.py", variable_name="x"))
+
+    with pytest.raises(InstructionError, match="inline_variable failed"):
+        execute_plan(plan, repo)
+
+    # A refusal must leave the file byte-for-byte untouched.
+    assert _read(target) == "x = 1\nprint(x)\nx = 2\n"
+
+
+def test_remove_dead_code_dispatch(tmp_path):
+    repo = tmp_path / "repo"
+    target = _write(repo / "app.py", "def dead():\n    return 1\n\n\ndef live():\n    return 2\n")
+
+    log = execute_plan(
+        _plan(RemoveDeadCode(id="s1", target_file="app.py", function_name="dead")),
+        repo,
+    )
+
+    assert _read(target) == "def live():\n    return 2\n"
+    assert log == ["[0] remove_dead_code: 1 change(s) in app.py"]
+
+
+def test_remove_dead_code_class_name_dispatch(tmp_path):
+    repo = tmp_path / "repo"
+    target = _write(repo / "app.py", "class Legacy:\n    pass\n\n\ndef live():\n    return 2\n")
+
+    log = execute_plan(
+        _plan(RemoveDeadCode(id="s1", target_file="app.py", class_name="Legacy")),
+        repo,
+    )
+
+    assert _read(target) == "def live():\n    return 2\n"
+    assert log == ["[0] remove_dead_code: 1 change(s) in app.py"]
+
+
+def test_move_symbol_dispatch(tmp_path):
+    repo = tmp_path / "repo"
+    _write(repo / "models.py", "class User:\n    pass\n")
+    _write(repo / "entities.py", "")
+    _write(repo / "service.py", "from models import User\nprint(User)\n")
+
+    log = execute_plan(
+        _plan(
+            MoveSymbol(
+                id="s1", source_file="models.py", target_file="entities.py", symbol_name="User"
+            )
+        ),
+        repo,
+    )
+
+    assert _read(repo / "models.py") == "\n"
+    assert _read(repo / "entities.py") == "class User:\n    pass"
+    assert _read(repo / "service.py") == "from entities import User\nprint(User)\n"
+    assert log == ["[0] move_symbol: 3 change(s) (models.py -> entities.py)"]
+
+
+def test_refused_move_raises_instruction_error_and_touches_nothing(tmp_path):
+    repo = tmp_path / "repo"
+    models = _write(repo / "models.py", "class User:\n    pass\n")
+    entities = _write(repo / "entities.py", "User = 1\n")
+
+    plan = _plan(
+        MoveSymbol(id="s1", source_file="models.py", target_file="entities.py", symbol_name="User")
+    )
+
+    with pytest.raises(InstructionError, match="move_symbol failed"):
+        execute_plan(plan, repo)
+
+    assert _read(models) == "class User:\n    pass\n"
+    assert _read(entities) == "User = 1\n"
+
+
+def test_inline_function_dispatch(tmp_path):
+    repo = tmp_path / "repo"
+    target = _write(
+        repo / "app.py",
+        "def add(a, b):\n    return a + b\n\n\nx = add(1, 2)\ny = add(x, 5)\n",
+    )
+
+    log = execute_plan(
+        _plan(InlineFunction(id="s1", target_file="app.py", function_name="add")),
+        repo,
+    )
+
+    assert _read(target) == "x = (1 + 2)\ny = (x + 5)\n"
+    assert log == ["[0] inline_function: 3 change(s) in app.py"]
+
+
+def test_split_class_dispatch(tmp_path):
+    repo = tmp_path / "repo"
+    math_src = (
+        "class Math:\n"
+        "    @staticmethod\n"
+        "    def add(a, b):\n"
+        "        return a + b\n"
+        "\n"
+        "    def use(self):\n"
+        "        return 1\n"
+    )
+    target = _write(repo / "app.py", math_src)
+
+    log = execute_plan(
+        _plan(
+            SplitClass(
+                id="s1",
+                target_file="app.py",
+                class_name="Math",
+                methods_to_move=["add"],
+                new_class_name="MathOps",
+            )
+        ),
+        repo,
+    )
+
+    text = _read(target)
+    assert "def add" in text.split("class MathOps:")[1]
+    assert log == ["[0] split_class: 2 change(s) in app.py"]
+
+
+def test_refused_inline_function_raises_instruction_error(tmp_path):
+    repo = tmp_path / "repo"
+    target = _write(repo / "app.py", "def f(a):\n    x = a\n    return x\n\n\nv = f(1)\n")
+
+    plan = _plan(InlineFunction(id="s1", target_file="app.py", function_name="f"))
+
+    with pytest.raises(InstructionError, match="inline_function failed"):
+        execute_plan(plan, repo)
+
+    # A refusal must leave the file byte-for-byte untouched.
+    assert _read(target) == "def f(a):\n    x = a\n    return x\n\n\nv = f(1)\n"
+
+
+def test_refused_split_class_raises_instruction_error(tmp_path):
+    repo = tmp_path / "repo"
+    target = _write(
+        repo / "app.py",
+        "class Math:\n    def add(self, a):\n        return self.value + a\n",
+    )
+    before = _read(target)
+
+    plan = _plan(
+        SplitClass(
+            id="s1",
+            target_file="app.py",
+            class_name="Math",
+            methods_to_move=["add"],
+            new_class_name="MathOps",
+        )
+    )
+
+    with pytest.raises(InstructionError, match="split_class failed"):
+        execute_plan(plan, repo)
+
+    assert _read(target) == before
+
+
+def test_move_symbol_missing_target_file_raises_file_not_found(tmp_path):
+    repo = tmp_path / "repo"
+    _write(repo / "models.py", "class User:\n    pass\n")
+
+    plan = _plan(
+        MoveSymbol(
+            id="s1", source_file="models.py", target_file="missing.py", symbol_name="User"
+        )
+    )
+
+    with pytest.raises(FileNotFoundError):
+        execute_plan(plan, repo)

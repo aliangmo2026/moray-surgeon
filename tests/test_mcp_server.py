@@ -116,7 +116,19 @@ def _commit_count(repo: Path) -> int:
 def test_list_available_actions_documents_every_action():
     text = list_available_actions()
 
-    for action in ("rename_symbol", "extract_function", "add_type_hints", "replace_call", "noop"):
+    for action in (
+        "rename_symbol",
+        "extract_function",
+        "extract_variable",
+        "inline_variable",
+        "remove_dead_code",
+        "move_symbol",
+        "inline_function",
+        "split_class",
+        "add_type_hints",
+        "replace_call",
+        "noop",
+    ):
         assert action in text
     assert "target_file" in text
     assert "JSON" in text

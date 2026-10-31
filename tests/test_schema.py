@@ -14,14 +14,20 @@ from moray_surgeon.schema import (
     AddTypeHints,
     CircularSchemaError,
     ExtractFunction,
+    ExtractVariable,
+    InlineFunction,
+    InlineVariable,
     Instruction,
     MorayError,
+    MoveSymbol,
     Noop,
     RefactorPlan,
+    RemoveDeadCode,
     RemoveImport,
     RenameSymbol,
     ReplaceCall,
     SchemaInlineError,
+    SplitClass,
 )
 from moray_surgeon.schema.instructions import _assert_no_ref_keys, _inline_document
 
@@ -84,7 +90,68 @@ ACTION_SAMPLES: list[tuple[dict[str, Any], type[Any]]] = [
         },
         RemoveImport,
     ),
-    ({"id": "step7", "action": "noop"}, Noop),
+    (
+        {
+            "id": "step7",
+            "action": "extract_variable",
+            "target_file": "pkg/mod.py",
+            "start_line": 3,
+            "start_column": 6,
+            "end_line": 3,
+            "end_column": 19,
+            "variable_name": "unit",
+        },
+        ExtractVariable,
+    ),
+    (
+        {
+            "id": "step8",
+            "action": "inline_variable",
+            "target_file": "pkg/mod.py",
+            "variable_name": "total",
+        },
+        InlineVariable,
+    ),
+    (
+        {
+            "id": "step9",
+            "action": "remove_dead_code",
+            "target_file": "pkg/mod.py",
+            "function_name": "legacy",
+        },
+        RemoveDeadCode,
+    ),
+    (
+        {
+            "id": "step10",
+            "action": "move_symbol",
+            "source_file": "pkg/mod.py",
+            "target_file": "pkg/other.py",
+            "symbol_name": "Widget",
+        },
+        MoveSymbol,
+    ),
+    (
+        {
+            "id": "step11",
+            "action": "inline_function",
+            "target_file": "pkg/mod.py",
+            "function_name": "helper",
+        },
+        InlineFunction,
+    ),
+    (
+        {
+            "id": "step12",
+            "action": "split_class",
+            "target_file": "pkg/mod.py",
+            "class_name": "Big",
+            "methods_to_move": ["first", "second"],
+            "new_class_name": "Small",
+        },
+        SplitClass,
+    ),
+    ({"id": "step13", "action": "noop"}, Noop),
 ]
 
 # REGENERATE: REGEN_SNAPSHOT=1 pytest tests/test_schema.py
@@ -212,6 +279,121 @@ def test_add_type_hints_function_name_is_optional() -> None:
         ({"id": "step 1", "action": "noop"}, "String should match pattern"),
         ({"id": "step1", "action": "noop", "depends_on": ["step 2"]}, "instruction ids"),
         ({"id": "step1", "action": "noop", "depends_on": ["a", "a"]}, "repeats"),
+        (
+            {
+                "id": "step1",
+                "action": "extract_variable",
+                "target_file": "a.py",
+                "start_line": 1,
+                "start_column": 0,
+                "end_line": 1,
+                "end_column": 5,
+                "variable_name": "not valid",
+            },
+            "Python identifier",
+        ),
+        (
+            {
+                "id": "step1",
+                "action": "inline_variable",
+                "target_file": "a.py",
+                "variable_name": "class",
+            },
+            "Python identifier",
+        ),
+        (
+            {
+                "id": "step1",
+                "action": "remove_dead_code",
+                "target_file": "a.py",
+            },
+            "exactly one of function_name",
+        ),
+        (
+            {
+                "id": "step1",
+                "action": "remove_dead_code",
+                "target_file": "a.py",
+                "function_name": "f",
+                "class_name": "C",
+            },
+            "exactly one of function_name",
+        ),
+        (
+            {
+                "id": "step1",
+                "action": "move_symbol",
+                "source_file": "a.py",
+                "target_file": "a.py",
+                "symbol_name": "F",
+            },
+            "must be different files",
+        ),
+        (
+            {
+                "id": "step1",
+                "action": "move_symbol",
+                "source_file": "a.py",
+                "target_file": "b.py",
+                "symbol_name": "not a name",
+            },
+            "Python identifier",
+        ),
+        (
+            {
+                "id": "step1",
+                "action": "inline_function",
+                "target_file": "a.py",
+                "function_name": "not a name",
+            },
+            "Python identifier",
+        ),
+        (
+            {
+                "id": "step1",
+                "action": "split_class",
+                "target_file": "a.py",
+                "class_name": "Big",
+                "methods_to_move": ["a", "a"],
+                "new_class_name": "Small",
+            },
+            "must not repeat",
+        ),
+        (
+            {
+                "id": "step1",
+                "action": "split_class",
+                "target_file": "a.py",
+                "class_name": "Big",
+                "methods_to_move": ["a"],
+                "new_class_name": "Big",
+            },
+            "must differ",
+        ),
+        (
+            {
+                "id": "step1",
+                "action": "split_class",
+                "target_file": "a.py",
+                "class_name": "Big",
+                "methods_to_move": [],
+                "new_class_name": "Small",
+            },
+            "at least 1 item",
+        ),
+        (
+            {
+                "id": "step1",
+                "action": "extract_variable",
+                "target_file": "a.py",
+                "start_line": 0,
+                "start_column": 0,
+                "end_line": 1,
+                "end_column": 5,
+                "variable_name": "v",
+            },
+            "greater than or equal to 1",
+        ),
     ],
 )
 def test_invalid_payload_raises_validation_error(payload: dict[str, Any], match: str) -> None:
@@ -340,6 +522,12 @@ def test_discriminator_mapping_values_are_inlined_dicts() -> None:
     expected_tags = {
         "rename_symbol",
         "extract_function",
+        "extract_variable",
+        "inline_variable",
+        "inline_function",
+        "split_class",
+        "remove_dead_code",
+        "move_symbol",
         "add_type_hints",
         "replace_call",
         "add_import",

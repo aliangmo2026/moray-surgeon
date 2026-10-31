@@ -15,10 +15,22 @@ When an attempt fails, the worktree diff is captured *before* the rollback and
 handed to the next parse together with the verification feedback. The model then
 sees both what it changed and why it broke, while the repository it plans against
 is back at HEAD.
+
+When the failed gate is pytest and its diagnostics name files under ``tests/``,
+the next prompt additionally says, in no uncertain terms, that the test code
+itself needs refactoring and that the plan should carry AST instructions
+targeting those test modules.
+
+On success — with all gates green and just before the commit — the orchestrator
+takes a second moray-scribe architecture snapshot and stores the comparison
+against the pre-refactor one in ``RefactorReport.architecture_diff``. A missing
+moray-scribe or a snapshot failure degrades to an empty diff; the lens never
+breaks the refactor.
 """
 
 from __future__ import annotations
 
+import re
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -26,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from moray_surgeon.architecture import capture_architecture, diff_architecture
 from moray_surgeon.engine.dispatcher import execute_plan
 from moray_surgeon.engine.repo_map import generate_repo_map
 from moray_surgeon.engine.scope_guard import (
@@ -47,6 +60,17 @@ _MAX_DIFF_CHARS = 12000
 # Card-mandated feedback for an empty plan; the full-width comma is intentional.
 _NOOP_PLAN_FEEDBACK = "你的计划为空，请重新根据指令生成具体的修改动作"  # noqa: RUF001
 _NOOP_DIFF = "(no diff: the previous plan made no changes)"
+# Card-mandated feedback when the pytest gate fails inside the test suite; the
+# full-width punctuation is intentional (the prompt is model-facing Chinese).
+_TEST_REPAIR_HINT = (
+    "注意：测试代码也需要被重构。请下发修改测试代码的 AST 指令。"  # noqa: RUF001
+)
+# A pytest diagnostic naming a file under the repository's tests/ directory.
+# pytest prints POSIX-style relative paths in summaries and short tracebacks on
+# every platform, but long tracebacks may show backslashed absolute paths on
+# Windows, so both separators are accepted. The lookbehind keeps neighbouring
+# identifiers (``conftests/``, ``subtests/``) from matching.
+_TEST_FILE_PATTERN = re.compile(r"(?<![\w-])tests[\\/][\w./\\-]+?\.py")
 
 
 @dataclass(frozen=True)
@@ -61,6 +85,9 @@ class RefactorReport:
         log: Dispatcher log lines of the successful round; empty on failure.
         last_verify: Verification result of the last round, success or failure.
         diff: Unified diff captured by a dry run; empty for normal runs.
+        architecture_diff: Human-readable before/after architecture comparison
+            produced by moray-scribe; empty when the structure did not change,
+            the run failed, or scribe is unavailable.
     """
 
     success: bool
@@ -69,6 +96,7 @@ class RefactorReport:
     log: list[str]
     last_verify: VerifyResult | None
     diff: str = ""
+    architecture_diff: str = ""
 
 
 class _VerificationFailed(Exception):  # noqa: N818 - internal control-flow signal, not an API error
@@ -211,6 +239,7 @@ class Orchestrator:
                 continue
             modified = _modified_file_count(plan)
             verify: VerifyResult | None = None
+            architecture_diff = ""
 
             try:
                 # A fresh transaction per round is what makes auto-fix safe: a
@@ -224,6 +253,8 @@ class Orchestrator:
                             # Inside the transaction, so user changes are already
                             # stashed and the baseline matches what the plan edits.
                             scope_snapshot = snapshot_repository(repo_root)
+                    with trace.step("Recording architecture snapshot (moray-scribe)..."):
+                        before_architecture = _capture_architecture_safely(repo_root, trace)
                     with trace.step("Applying AST instructions..."):
                         log = execute_plan(plan, repo_root)
                     trace.success(f"Plan applied. Modified {modified} file(s).")
@@ -241,6 +272,13 @@ class Orchestrator:
                         failure = _VerificationFailed(verify, _capture_diff(repo_root))
                         trace.error("Test failed! Rollback initiated.")
                         raise failure
+                    # All gates green, commit pending: compare the architecture
+                    # against the pre-refactor snapshot. A capture failure (or a
+                    # missing moray-scribe) leaves the diff empty.
+                    after_architecture = _capture_architecture_safely(repo_root, trace)
+                    architecture_diff = diff_architecture(
+                        before_architecture, after_architecture
+                    ).text
             except _DryRunComplete as exc:
                 trace.success("Dry run complete. Rolled back.")
                 return RefactorReport(
@@ -263,6 +301,7 @@ class Orchestrator:
                 plan=plan,
                 log=log,
                 last_verify=verify,
+                architecture_diff=architecture_diff,
             )
 
         return RefactorReport(
@@ -288,6 +327,20 @@ def _modified_file_count(plan: RefactorPlan) -> int:
     return len(
         {item.target_file for item in plan.instructions if not isinstance(item, Noop)}
     )
+
+
+def _capture_architecture_safely(repo_root: Path, trace: LiveTrace | _NullTrace) -> str | None:
+    """Take a scribe snapshot, converting any failure into ``None``.
+
+    The architecture lens must never be the reason a refactor fails: a missing
+    moray-scribe, an unparseable file or any other snapshot error degrades to
+    ``None`` and the comparison is skipped.
+    """
+    try:
+        return capture_architecture(repo_root)
+    except Exception:
+        trace.info("Architecture snapshot unavailable; skipping the comparison.")
+        return None
 
 
 def _verify_scope_gate(
@@ -362,4 +415,38 @@ def _compose_context(context: str, failure: _VerificationFailed) -> str:
         "Generate a new RefactorPlan that fixes this failure. Do not repeat the "
         "same changes."
     )
+    failing_tests = _failing_test_files(failure.verify)
+    if failing_tests:
+        sections.append(_test_repair_reminder(failing_tests))
     return "\n\n".join(sections)
+
+
+def _failing_test_files(verify: VerifyResult) -> list[str]:
+    """Test modules under ``tests/`` that a failed pytest gate names.
+
+    Only the pytest stage is inspected: that is the gate that actually executes
+    the tests, and the task of updating them belongs to test-repair plans. The
+    same file may appear several times in one report (summary line, traceback,
+    collection error); duplicates collapse.
+    """
+    if verify.ok or verify.stage != "pytest":
+        return []
+    haystack = f"{verify.stdout}\n{verify.stderr}"
+    found = {
+        match.group(0).replace("\\", "/") for match in _TEST_FILE_PATTERN.finditer(haystack)
+    }
+    return sorted(found)
+
+
+def _test_repair_reminder(failing_tests: list[str]) -> str:
+    """Tell the model, explicitly, that the test code must be refactored too."""
+    listed = "\n".join(f"- {name}" for name in failing_tests)
+    return (
+        f"{_TEST_REPAIR_HINT}\n"
+        "The pytest failure points at test code:\n"
+        f"{listed}\n"
+        "Include AST instructions whose target_file is that test module — for "
+        "example rename_symbol or replace_call — so the tests follow the "
+        "refactored source. Update the symbols and callees the tests reference; "
+        "do not change what the tests assert."
+    )

@@ -218,6 +218,23 @@ def test_system_prompt_documents_ids_and_dependencies(monkeypatch):
     assert "unique \"id\"" in system
 
 
+def test_system_prompt_permits_and_urges_test_directory_edits(monkeypatch):
+    """Test modules are legitimate targets when a refactor breaks them."""
+    fake = _FakeOllama([json.dumps(_plan_payload())])
+    _install(monkeypatch, fake)
+
+    IntentParser().parse("rename it", Path("repo"))
+
+    system = fake.calls[0][1]["json"]["messages"][0]["content"]
+    assert "Tests are callers too" in system
+    assert "under tests/" in system
+    # Both actions the repair loop relies on are named explicitly.
+    assert "rename_symbol" in system
+    assert "replace_call" in system
+    # The edits stay surgical: assertions' meaning must survive.
+    assert "never change what the tests assert" in system
+
+
 def test_cyclic_plan_is_repaired_in_the_next_round(monkeypatch):
     fake = _FakeOllama([_cyclic_payload(), json.dumps(_plan_payload())])
     _install(monkeypatch, fake)

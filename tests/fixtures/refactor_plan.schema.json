@@ -187,6 +187,219 @@
               "title": "ExtractFunction",
               "type": "object"
             },
+            "extract_variable": {
+              "additionalProperties": false,
+              "description": "Extract the expression at an exact source range into a new variable.\n\nThe engine locates the unique expression node occupying the range and\nrewrites it to ``variable_name`` while inserting\n``variable_name = <expression>`` on its own line just before the statement\nthat contains the range.\n\nCoordinates follow libcst's ``PositionProvider``: lines are 1-based,\ncolumns are 0-based, and the end coordinates point *one past* the\nexpression's last character (exclusive, like editor selection ranges).\nNOTE: ordering of the four coordinates is enforced by the engine layer,\nnot here.",
+              "properties": {
+                "action": {
+                  "const": "extract_variable",
+                  "default": "extract_variable",
+                  "title": "Action",
+                  "type": "string"
+                },
+                "depends_on": {
+                  "description": "Ids of the steps that must execute before this one.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Depends On",
+                  "type": "array"
+                },
+                "end_column": {
+                  "minimum": 0,
+                  "title": "End Column",
+                  "type": "integer"
+                },
+                "end_line": {
+                  "minimum": 1,
+                  "title": "End Line",
+                  "type": "integer"
+                },
+                "id": {
+                  "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                  "title": "Id",
+                  "type": "string"
+                },
+                "reasoning": {
+                  "default": "",
+                  "title": "Reasoning",
+                  "type": "string"
+                },
+                "start_column": {
+                  "minimum": 0,
+                  "title": "Start Column",
+                  "type": "integer"
+                },
+                "start_line": {
+                  "minimum": 1,
+                  "title": "Start Line",
+                  "type": "integer"
+                },
+                "target_file": {
+                  "title": "Target File",
+                  "type": "string"
+                },
+                "variable_name": {
+                  "title": "Variable Name",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "target_file",
+                "start_line",
+                "start_column",
+                "end_line",
+                "end_column",
+                "variable_name"
+              ],
+              "title": "ExtractVariable",
+              "type": "object"
+            },
+            "inline_function": {
+              "additionalProperties": false,
+              "description": "Inline a single-return function into every same-module call site.\n\nThe engine requires the function to be a unique top-level ``def`` whose\nbody is exactly one ``return <expr>``; the expression's parameters are\nsubstituted with the caller's arguments at every call site and the\ndefinition is deleted. Anything ambiguous — recursion, side-effecting\nbodies used more than once, parameters used twice with impure arguments,\ncallers outside the file — refuses the inline.",
+              "properties": {
+                "action": {
+                  "const": "inline_function",
+                  "default": "inline_function",
+                  "title": "Action",
+                  "type": "string"
+                },
+                "depends_on": {
+                  "description": "Ids of the steps that must execute before this one.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Depends On",
+                  "type": "array"
+                },
+                "function_name": {
+                  "title": "Function Name",
+                  "type": "string"
+                },
+                "id": {
+                  "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                  "title": "Id",
+                  "type": "string"
+                },
+                "reasoning": {
+                  "default": "",
+                  "title": "Reasoning",
+                  "type": "string"
+                },
+                "target_file": {
+                  "title": "Target File",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "target_file",
+                "function_name"
+              ],
+              "title": "InlineFunction",
+              "type": "object"
+            },
+            "inline_variable": {
+              "additionalProperties": false,
+              "description": "Inline the single assignment of ``variable_name`` into every reference.\n\nThe engine requires the variable to be bound exactly once in its scope\n(SSA form), read only after that assignment, never captured by a nested\nfunction/class, and never referenced from another module. Anything else is\nrefused with ``ValueError`` instead of producing a semantic change.",
+              "properties": {
+                "action": {
+                  "const": "inline_variable",
+                  "default": "inline_variable",
+                  "title": "Action",
+                  "type": "string"
+                },
+                "depends_on": {
+                  "description": "Ids of the steps that must execute before this one.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Depends On",
+                  "type": "array"
+                },
+                "id": {
+                  "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                  "title": "Id",
+                  "type": "string"
+                },
+                "reasoning": {
+                  "default": "",
+                  "title": "Reasoning",
+                  "type": "string"
+                },
+                "target_file": {
+                  "title": "Target File",
+                  "type": "string"
+                },
+                "variable_name": {
+                  "title": "Variable Name",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "target_file",
+                "variable_name"
+              ],
+              "title": "InlineVariable",
+              "type": "object"
+            },
+            "move_symbol": {
+              "additionalProperties": false,
+              "description": "Move a top-level function or class from one file to another.\n\nThe node (with its leading comments and docstring) is appended to\n``target_file`` and deleted from ``source_file``. ``from <source> import\n<symbol>`` statements in other in-repo modules are rewritten to import from\nthe target module; anything the engine cannot prove safe — relative imports\ncrossing directories, attribute-style usage, leftover references in the\nsource file itself — refuses the whole move.",
+              "properties": {
+                "action": {
+                  "const": "move_symbol",
+                  "default": "move_symbol",
+                  "title": "Action",
+                  "type": "string"
+                },
+                "depends_on": {
+                  "description": "Ids of the steps that must execute before this one.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Depends On",
+                  "type": "array"
+                },
+                "id": {
+                  "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                  "title": "Id",
+                  "type": "string"
+                },
+                "reasoning": {
+                  "default": "",
+                  "title": "Reasoning",
+                  "type": "string"
+                },
+                "source_file": {
+                  "title": "Source File",
+                  "type": "string"
+                },
+                "symbol_name": {
+                  "title": "Symbol Name",
+                  "type": "string"
+                },
+                "target_file": {
+                  "title": "Target File",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "source_file",
+                "target_file",
+                "symbol_name"
+              ],
+              "title": "MoveSymbol",
+              "type": "object"
+            },
             "noop": {
               "additionalProperties": false,
               "description": "Explicit no-operation carrying a human-readable message.",
@@ -226,6 +439,71 @@
                 "id"
               ],
               "title": "Noop",
+              "type": "object"
+            },
+            "remove_dead_code": {
+              "additionalProperties": false,
+              "description": "Delete a top-level function or class that nothing references.\n\nIdentify the dead symbol with exactly one of ``function_name`` or\n``class_name``. The engine confirms project-wide deadness with Jedi and\nrefuses on any doubt: any reference, any ``__all__`` entry, any string\nliteral that could be a dynamic ``getattr`` key, any decorator on the\nsymbol, any star import of its module.",
+              "properties": {
+                "action": {
+                  "const": "remove_dead_code",
+                  "default": "remove_dead_code",
+                  "title": "Action",
+                  "type": "string"
+                },
+                "class_name": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "Class Name"
+                },
+                "depends_on": {
+                  "description": "Ids of the steps that must execute before this one.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Depends On",
+                  "type": "array"
+                },
+                "function_name": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "Function Name"
+                },
+                "id": {
+                  "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                  "title": "Id",
+                  "type": "string"
+                },
+                "reasoning": {
+                  "default": "",
+                  "title": "Reasoning",
+                  "type": "string"
+                },
+                "target_file": {
+                  "title": "Target File",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "target_file"
+              ],
+              "title": "RemoveDeadCode",
               "type": "object"
             },
             "remove_import": {
@@ -387,6 +665,66 @@
               ],
               "title": "ReplaceCall",
               "type": "object"
+            },
+            "split_class": {
+              "additionalProperties": false,
+              "description": "Move methods of one class into a new sibling class.\n\nFor this iteration the moved methods must not touch their receiver at all:\nany ``self`` / ``cls`` usage (or ``super()``) refuses the split, so only\nstate-free methods can move. Instance-state migration is future work.",
+              "properties": {
+                "action": {
+                  "const": "split_class",
+                  "default": "split_class",
+                  "title": "Action",
+                  "type": "string"
+                },
+                "class_name": {
+                  "title": "Class Name",
+                  "type": "string"
+                },
+                "depends_on": {
+                  "description": "Ids of the steps that must execute before this one.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "title": "Depends On",
+                  "type": "array"
+                },
+                "id": {
+                  "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                  "title": "Id",
+                  "type": "string"
+                },
+                "methods_to_move": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "minItems": 1,
+                  "title": "Methods To Move",
+                  "type": "array"
+                },
+                "new_class_name": {
+                  "title": "New Class Name",
+                  "type": "string"
+                },
+                "reasoning": {
+                  "default": "",
+                  "title": "Reasoning",
+                  "type": "string"
+                },
+                "target_file": {
+                  "title": "Target File",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "target_file",
+                "class_name",
+                "methods_to_move",
+                "new_class_name"
+              ],
+              "title": "SplitClass",
+              "type": "object"
             }
           },
           "propertyName": "action"
@@ -499,6 +837,344 @@
               "end_line"
             ],
             "title": "ExtractFunction",
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Extract the expression at an exact source range into a new variable.\n\nThe engine locates the unique expression node occupying the range and\nrewrites it to ``variable_name`` while inserting\n``variable_name = <expression>`` on its own line just before the statement\nthat contains the range.\n\nCoordinates follow libcst's ``PositionProvider``: lines are 1-based,\ncolumns are 0-based, and the end coordinates point *one past* the\nexpression's last character (exclusive, like editor selection ranges).\nNOTE: ordering of the four coordinates is enforced by the engine layer,\nnot here.",
+            "properties": {
+              "action": {
+                "const": "extract_variable",
+                "default": "extract_variable",
+                "title": "Action",
+                "type": "string"
+              },
+              "depends_on": {
+                "description": "Ids of the steps that must execute before this one.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Depends On",
+                "type": "array"
+              },
+              "end_column": {
+                "minimum": 0,
+                "title": "End Column",
+                "type": "integer"
+              },
+              "end_line": {
+                "minimum": 1,
+                "title": "End Line",
+                "type": "integer"
+              },
+              "id": {
+                "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                "title": "Id",
+                "type": "string"
+              },
+              "reasoning": {
+                "default": "",
+                "title": "Reasoning",
+                "type": "string"
+              },
+              "start_column": {
+                "minimum": 0,
+                "title": "Start Column",
+                "type": "integer"
+              },
+              "start_line": {
+                "minimum": 1,
+                "title": "Start Line",
+                "type": "integer"
+              },
+              "target_file": {
+                "title": "Target File",
+                "type": "string"
+              },
+              "variable_name": {
+                "title": "Variable Name",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "target_file",
+              "start_line",
+              "start_column",
+              "end_line",
+              "end_column",
+              "variable_name"
+            ],
+            "title": "ExtractVariable",
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Inline the single assignment of ``variable_name`` into every reference.\n\nThe engine requires the variable to be bound exactly once in its scope\n(SSA form), read only after that assignment, never captured by a nested\nfunction/class, and never referenced from another module. Anything else is\nrefused with ``ValueError`` instead of producing a semantic change.",
+            "properties": {
+              "action": {
+                "const": "inline_variable",
+                "default": "inline_variable",
+                "title": "Action",
+                "type": "string"
+              },
+              "depends_on": {
+                "description": "Ids of the steps that must execute before this one.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Depends On",
+                "type": "array"
+              },
+              "id": {
+                "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                "title": "Id",
+                "type": "string"
+              },
+              "reasoning": {
+                "default": "",
+                "title": "Reasoning",
+                "type": "string"
+              },
+              "target_file": {
+                "title": "Target File",
+                "type": "string"
+              },
+              "variable_name": {
+                "title": "Variable Name",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "target_file",
+              "variable_name"
+            ],
+            "title": "InlineVariable",
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Inline a single-return function into every same-module call site.\n\nThe engine requires the function to be a unique top-level ``def`` whose\nbody is exactly one ``return <expr>``; the expression's parameters are\nsubstituted with the caller's arguments at every call site and the\ndefinition is deleted. Anything ambiguous — recursion, side-effecting\nbodies used more than once, parameters used twice with impure arguments,\ncallers outside the file — refuses the inline.",
+            "properties": {
+              "action": {
+                "const": "inline_function",
+                "default": "inline_function",
+                "title": "Action",
+                "type": "string"
+              },
+              "depends_on": {
+                "description": "Ids of the steps that must execute before this one.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Depends On",
+                "type": "array"
+              },
+              "function_name": {
+                "title": "Function Name",
+                "type": "string"
+              },
+              "id": {
+                "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                "title": "Id",
+                "type": "string"
+              },
+              "reasoning": {
+                "default": "",
+                "title": "Reasoning",
+                "type": "string"
+              },
+              "target_file": {
+                "title": "Target File",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "target_file",
+              "function_name"
+            ],
+            "title": "InlineFunction",
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Move methods of one class into a new sibling class.\n\nFor this iteration the moved methods must not touch their receiver at all:\nany ``self`` / ``cls`` usage (or ``super()``) refuses the split, so only\nstate-free methods can move. Instance-state migration is future work.",
+            "properties": {
+              "action": {
+                "const": "split_class",
+                "default": "split_class",
+                "title": "Action",
+                "type": "string"
+              },
+              "class_name": {
+                "title": "Class Name",
+                "type": "string"
+              },
+              "depends_on": {
+                "description": "Ids of the steps that must execute before this one.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Depends On",
+                "type": "array"
+              },
+              "id": {
+                "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                "title": "Id",
+                "type": "string"
+              },
+              "methods_to_move": {
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1,
+                "title": "Methods To Move",
+                "type": "array"
+              },
+              "new_class_name": {
+                "title": "New Class Name",
+                "type": "string"
+              },
+              "reasoning": {
+                "default": "",
+                "title": "Reasoning",
+                "type": "string"
+              },
+              "target_file": {
+                "title": "Target File",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "target_file",
+              "class_name",
+              "methods_to_move",
+              "new_class_name"
+            ],
+            "title": "SplitClass",
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Delete a top-level function or class that nothing references.\n\nIdentify the dead symbol with exactly one of ``function_name`` or\n``class_name``. The engine confirms project-wide deadness with Jedi and\nrefuses on any doubt: any reference, any ``__all__`` entry, any string\nliteral that could be a dynamic ``getattr`` key, any decorator on the\nsymbol, any star import of its module.",
+            "properties": {
+              "action": {
+                "const": "remove_dead_code",
+                "default": "remove_dead_code",
+                "title": "Action",
+                "type": "string"
+              },
+              "class_name": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Class Name"
+              },
+              "depends_on": {
+                "description": "Ids of the steps that must execute before this one.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Depends On",
+                "type": "array"
+              },
+              "function_name": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Function Name"
+              },
+              "id": {
+                "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                "title": "Id",
+                "type": "string"
+              },
+              "reasoning": {
+                "default": "",
+                "title": "Reasoning",
+                "type": "string"
+              },
+              "target_file": {
+                "title": "Target File",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "target_file"
+            ],
+            "title": "RemoveDeadCode",
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Move a top-level function or class from one file to another.\n\nThe node (with its leading comments and docstring) is appended to\n``target_file`` and deleted from ``source_file``. ``from <source> import\n<symbol>`` statements in other in-repo modules are rewritten to import from\nthe target module; anything the engine cannot prove safe — relative imports\ncrossing directories, attribute-style usage, leftover references in the\nsource file itself — refuses the whole move.",
+            "properties": {
+              "action": {
+                "const": "move_symbol",
+                "default": "move_symbol",
+                "title": "Action",
+                "type": "string"
+              },
+              "depends_on": {
+                "description": "Ids of the steps that must execute before this one.",
+                "items": {
+                  "type": "string"
+                },
+                "title": "Depends On",
+                "type": "array"
+              },
+              "id": {
+                "description": "Unique id of this step inside the plan, for example 'step1'. Other steps reference it from depends_on.",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                "title": "Id",
+                "type": "string"
+              },
+              "reasoning": {
+                "default": "",
+                "title": "Reasoning",
+                "type": "string"
+              },
+              "source_file": {
+                "title": "Source File",
+                "type": "string"
+              },
+              "symbol_name": {
+                "title": "Symbol Name",
+                "type": "string"
+              },
+              "target_file": {
+                "title": "Target File",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "source_file",
+              "target_file",
+              "symbol_name"
+            ],
+            "title": "MoveSymbol",
             "type": "object"
           },
           {

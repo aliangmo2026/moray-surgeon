@@ -58,6 +58,11 @@ Hard rules:
 7. Use the "noop" action when the intent requires no edit.
 8. If the user message carries a previous attempt's git diff and verification errors,
    fix those specific problems instead of repeating the same plan.
+9. Tests are callers too. When the intent or the repair context shows failing test
+   files under tests/, include rename_symbol or replace_call instructions whose
+   target_file is that test module so the tests follow the refactored source. Keep
+   test edits surgical: update only the symbols and callee names the tests
+   reference; never change what the tests assert.
 
 JSON Schema (the response must validate against it):
 {schema}
