@@ -184,6 +184,51 @@ def test_success_on_first_attempt(tmp_path):
     assert _git(repo, "status", "--porcelain").stdout == ""
 
 
+def test_code_index_is_refreshed_before_the_transaction(tmp_path, monkeypatch):
+    """The index is built before the attempt and describes the committed result."""
+    from moray_surgeon.engine import indexer as indexer_module
+
+    calls: list[str] = []
+    original = indexer_module.Indexer.refresh
+
+    def recording_refresh(self, **kwargs: object):
+        calls.append("refresh")
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(indexer_module.Indexer, "refresh", recording_refresh)
+    repo = _init_repo(tmp_path)
+    parser = FakeParser([_rename_plan()])
+    verifier = FakeVerifier([_ok()])
+
+    report = Orchestrator(parser, verifier).run("rename old_name", repo)
+
+    assert report.success is True
+    assert calls, "the orchestrator must refresh the index before applying a plan"
+    database = repo / ".moray-cache" / "index.sqlite3"
+    assert database.exists()
+    # The cache is ignored locally, so it never lands in the refactor commit.
+    assert _git(repo, "status", "--porcelain").stdout == ""
+    assert "index.sqlite3" not in _git(repo, "ls-files").stdout
+
+    from moray_surgeon.engine.indexer import Indexer, reset_indexers
+
+    reset_indexers()
+    assert Indexer(repo).files_with("new_name"), "the index must describe the result"
+
+
+def test_unavailable_code_index_does_not_break_the_run(tmp_path):
+    """A cache directory that is really a file degrades to the full-scan path."""
+    repo = _init_repo(tmp_path)
+    (repo / ".moray-cache").write_text("not a directory", encoding="utf-8")
+    parser = FakeParser([_rename_plan()])
+    verifier = FakeVerifier([_ok()])
+
+    report = Orchestrator(parser, verifier).run("rename old_name", repo)
+
+    assert report.success is True
+    assert _read(repo / "app.py") == "def new_name():\n    return new_name()\n"
+
+
 def test_auto_fix_replans_from_clean_head_with_diff_context(tmp_path):
     repo = _init_repo(tmp_path)
     parser = FakeParser([_rename_plan()])

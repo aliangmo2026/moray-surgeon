@@ -21,10 +21,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from moray_surgeon.engine.base import EditResult
+from moray_surgeon.engine.convert_match import convert_to_match_case
 from moray_surgeon.engine.dag import topological_sort
 from moray_surgeon.engine.extract import extract_function
 from moray_surgeon.engine.extract_variable import extract_variable
 from moray_surgeon.engine.import_manager import add_import, remove_import
+from moray_surgeon.engine.indexer import Indexer, get_indexer
 from moray_surgeon.engine.inline_function import inline_function
 from moray_surgeon.engine.inline_variable import inline_variable
 from moray_surgeon.engine.move_symbol import move_symbol
@@ -41,6 +43,7 @@ from moray_surgeon.exceptions import (
 from moray_surgeon.schema.instructions import (
     AddImport,
     AddTypeHints,
+    ConvertToMatchCase,
     ExtractFunction,
     ExtractVariable,
     InlineFunction,
@@ -57,7 +60,9 @@ from moray_surgeon.schema.instructions import (
 )
 
 
-def execute_plan(plan: RefactorPlan, repo_root: Path) -> list[str]:
+def execute_plan(
+    plan: RefactorPlan, repo_root: Path, indexer: Indexer | None = None
+) -> list[str]:
     """Execute every instruction in dependency order; raise on the first failure.
 
     Args:
@@ -65,6 +70,9 @@ def execute_plan(plan: RefactorPlan, repo_root: Path) -> list[str]:
             topologically sorted on ``depends_on``; steps without dependencies
             keep their authored order.
         repo_root: Directory every ``target_file`` is resolved against.
+        indexer: Optional code-index handle shared by the project-aware atoms.
+            Omitting it uses the process-wide handle for ``repo_root``, which the
+            orchestrator has already refreshed for this attempt.
 
     Returns:
         One human-readable log line per applied instruction, in execution order.
@@ -83,6 +91,7 @@ def execute_plan(plan: RefactorPlan, repo_root: Path) -> list[str]:
         OSError: Reading or writing the target file failed (permissions, ...).
     """
     root = repo_root.resolve()
+    handle = indexer or get_indexer(root)
     log: list[str] = []
 
     for index, instruction in enumerate(topological_sort(plan.instructions)):
@@ -91,15 +100,13 @@ def execute_plan(plan: RefactorPlan, repo_root: Path) -> list[str]:
             continue
 
         if isinstance(instruction, MoveSymbol):
-            log.append(
-                _execute_move_symbol(instruction, index, root)
-            )
+            log.append(_execute_move_symbol(instruction, index, root, handle))
             continue
 
         target = _resolve_target(instruction.target_file, root)
         source = target.read_text(encoding="utf-8")
         try:
-            result = _apply(instruction, source, root, target)
+            result = _apply(instruction, source, root, target, handle)
         except ValueError as exc:
             raise InstructionError(
                 f"{instruction.action} failed for {instruction.target_file}: {exc}",
@@ -118,7 +125,9 @@ def execute_plan(plan: RefactorPlan, repo_root: Path) -> list[str]:
     return log
 
 
-def _execute_move_symbol(instruction: MoveSymbol, index: int, root: Path) -> str:
+def _execute_move_symbol(
+    instruction: MoveSymbol, index: int, root: Path, indexer: Indexer
+) -> str:
     """Run the project-aware move atom; it writes every affected file itself.
 
     Unlike the single-file atoms, a move touches the source, the target and
@@ -128,7 +137,9 @@ def _execute_move_symbol(instruction: MoveSymbol, index: int, root: Path) -> str
     source_path = _resolve_target(instruction.source_file, root)
     target_path = _resolve_target(instruction.target_file, root)
     try:
-        result = move_symbol(root, source_path, target_path, instruction.symbol_name)
+        result = move_symbol(
+            root, source_path, target_path, instruction.symbol_name, indexer
+        )
     except ValueError as exc:
         raise InstructionError(
             f"{instruction.action} failed for {instruction.source_file}: {exc}",
@@ -164,7 +175,13 @@ def _resolve_target(target_file: str, repo_root: Path) -> Path:
     return target
 
 
-def _apply(instruction: Instruction, source: str, repo_root: Path, target: Path) -> EditResult:
+def _apply(
+    instruction: Instruction,
+    source: str,
+    repo_root: Path,
+    target: Path,
+    indexer: Indexer,
+) -> EditResult:
     """Dispatch one non-noop instruction to its atomic engine operation.
 
     ``rename_symbol``, ``inline_variable`` and ``remove_dead_code`` are
@@ -180,11 +197,18 @@ def _apply(instruction: Instruction, source: str, repo_root: Path, target: Path)
             instruction.target_file,
             instruction.old_name,
             instruction.new_name,
+            indexer,
         )
     if isinstance(instruction, ExtractFunction):
         return extract_function(
             source,
             instruction.function_name,
+            instruction.start_line,
+            instruction.end_line,
+        )
+    if isinstance(instruction, ConvertToMatchCase):
+        return convert_to_match_case(
+            source,
             instruction.start_line,
             instruction.end_line,
         )

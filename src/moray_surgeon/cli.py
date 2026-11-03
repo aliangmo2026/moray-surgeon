@@ -10,7 +10,9 @@ import typer
 
 from moray_surgeon import __version__
 from moray_surgeon.audit import run_audit
-from moray_surgeon.exceptions import MorayError
+from moray_surgeon.engine.indexer import Indexer
+from moray_surgeon.engine.indexer import clear_cache as clear_index_cache
+from moray_surgeon.exceptions import CacheError, MorayError
 from moray_surgeon.intent import IntentParser
 from moray_surgeon.orchestrator import Orchestrator
 from moray_surgeon.schema import RefactorPlan
@@ -70,11 +72,24 @@ def refactor(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Show the diff and roll back without committing."
     ),
+    clear_cache: bool = typer.Option(
+        False,
+        "--clear-cache",
+        help="Delete the local code index before running (it is rebuilt on demand).",
+    ),
 ) -> None:
     """Plan, apply, verify and auto-fix one refactoring intent."""
     if not (path / ".git").exists():
         typer.echo(f"error: {path} is not a git repository", err=True)
         raise typer.Exit(code=2)
+
+    if clear_cache:
+        try:
+            removed = clear_index_cache(path)
+        except CacheError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+        typer.echo("Code index cleared." if removed else "No code index to clear.")
 
     # The environment is the preferred credential channel: a flag is visible in
     # shell history and process listings. An empty flag falls back to the env.
@@ -178,6 +193,39 @@ def mcp() -> None:
     from moray_surgeon.mcp_server import main as run_mcp_server
 
     run_mcp_server()
+
+
+@app.command()
+def cache(
+    path: Path = typer.Option(Path("."), "--path", help="Repository root."),
+    clear: bool = typer.Option(
+        False, "--clear-cache", "--clear", help="Delete the local code index."
+    ),
+    show_stats: bool = typer.Option(
+        False, "--stats", help="Print the size and contents of the index."
+    ),
+) -> None:
+    """Inspect or clear the local code index used by rename/move.
+
+    The index lives in ``<repo>/.moray-cache/index.sqlite3`` and is rebuilt on
+    demand, so clearing it never loses information: the next refactor recreates
+    it from the sources.
+    """
+    try:
+        if clear:
+            removed = clear_index_cache(path)
+            typer.echo("Code index cleared." if removed else "No code index to clear.")
+            if not show_stats:
+                return
+        summary = Indexer(path).summary()
+    except CacheError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"index: {summary.path}")
+    typer.echo(f"files: {summary.files}")
+    typer.echo(f"symbols: {summary.symbols}")
+    typer.echo(f"size: {summary.size_bytes} bytes")
 
 
 def _load_plan(plan_path: Path | None) -> RefactorPlan | None:

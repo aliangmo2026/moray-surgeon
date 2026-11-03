@@ -235,6 +235,7 @@ def test_engine_package_exposes_the_atoms_and_dispatcher() -> None:
     assert set(engine_package.__all__) == {
         "add_import",
         "add_type_hints",
+        "convert_to_match_case",
         "execute_plan",
         "extract_function",
         "extract_variable",

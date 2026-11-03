@@ -40,13 +40,14 @@ from typing import TYPE_CHECKING
 
 from moray_surgeon.architecture import capture_architecture, diff_architecture
 from moray_surgeon.engine.dispatcher import execute_plan
+from moray_surgeon.engine.indexer import get_indexer
 from moray_surgeon.engine.repo_map import generate_repo_map
 from moray_surgeon.engine.scope_guard import (
     RepositorySnapshot,
     snapshot_repository,
     verify_repository_scope,
 )
-from moray_surgeon.exceptions import ScopeViolationError
+from moray_surgeon.exceptions import CacheError, ScopeViolationError
 from moray_surgeon.intent import IntentParser
 from moray_surgeon.schema import Noop, RefactorPlan
 from moray_surgeon.transaction import TransactionManager
@@ -241,12 +242,29 @@ class Orchestrator:
             verify: VerifyResult | None = None
             architecture_diff = ""
 
+            # Before the transaction opens: stat the tree once and re-parse only
+            # the files whose mtime or digest moved, so the plan's rename/move
+            # instructions query a warm index instead of making Jedi scan the
+            # repository per instruction.
+            index_ready = _refresh_index_safely(repo_root, trace)
+
             try:
                 # A fresh transaction per round is what makes auto-fix safe: a
                 # failed verify rolls back to HEAD before the next plan arrives.
                 with TransactionManager(
                     repo_root, commit_message=f"moray-surgeon: {intent[:60]}"
-                ):
+                ) as transaction:
+                    if transaction.stashed:
+                        # Stashing reverted the user's uncommitted work, so the
+                        # index built a moment ago describes files that are no
+                        # longer on disk. Re-stat before the plan touches them.
+                        if index_ready:
+                            index_ready = _refresh_index_safely(repo_root, trace)
+                        if not index_ready:
+                            # Never rebuild a cache the stash may be holding: that
+                            # would make `git stash apply` refuse to restore the
+                            # user's files. Full scans see us through this run.
+                            get_indexer(repo_root).suspend()
                     scope_snapshot: RepositorySnapshot | None = None
                     if self._scope_guard:
                         with trace.step("Recording AST scope fingerprints..."):
@@ -327,6 +345,26 @@ def _modified_file_count(plan: RefactorPlan) -> int:
     return len(
         {item.target_file for item in plan.instructions if not isinstance(item, Noop)}
     )
+
+
+def _refresh_index_safely(repo_root: Path, trace: LiveTrace | _NullTrace) -> bool:
+    """Refresh the code index, reporting rather than raising on failure.
+
+    The index only ever narrows the candidate set for the project-aware atoms,
+    and those fall back to a full Jedi scan when the database is missing. A
+    read-only checkout, a locked database or a filesystem without SQLite support
+    must therefore never stop a refactor.
+
+    Returns:
+        True when the index is usable, False when the refresh failed and this run
+        has to manage without it.
+    """
+    try:
+        get_indexer(repo_root).refresh()
+        return True
+    except (CacheError, OSError) as exc:
+        trace.info(f"Code index unavailable ({exc}); falling back to full scans.")
+        return False
 
 
 def _capture_architecture_safely(repo_root: Path, trace: LiveTrace | _NullTrace) -> str | None:

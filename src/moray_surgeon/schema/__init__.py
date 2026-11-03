@@ -8,6 +8,7 @@ from moray_surgeon.schema.exceptions import (
 from moray_surgeon.schema.instructions import (
     AddImport,
     AddTypeHints,
+    ConvertToMatchCase,
     ExtractFunction,
     ExtractVariable,
     InlineFunction,
@@ -27,6 +28,7 @@ __all__ = [
     "AddImport",
     "AddTypeHints",
     "CircularSchemaError",
+    "ConvertToMatchCase",
     "ExtractFunction",
     "ExtractVariable",
     "InlineFunction",

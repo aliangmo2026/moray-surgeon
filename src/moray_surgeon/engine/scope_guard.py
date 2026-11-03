@@ -40,6 +40,7 @@ from moray_surgeon.exceptions import ScopeViolationError
 from moray_surgeon.schema.instructions import (
     AddImport,
     AddTypeHints,
+    ConvertToMatchCase,
     ExtractFunction,
     Noop,
     RefactorPlan,
@@ -366,7 +367,11 @@ def _is_allowed(
             # A rename of a constant, a module-level call site or an extracted
             # block all rewrite a statement this fingerprint covers.
             return True
-        if isinstance(instruction, ReplaceCall):
+        if isinstance(instruction, (ReplaceCall, ConvertToMatchCase)):
+            # Both rewrite statements whose *body* the plan does not name: a
+            # callee swap anywhere in the file, and an if/elif chain whose own
+            # qualified key (the enclosing function) is what the fingerprint
+            # reports. The engine still validates the line range before editing.
             return True
         if isinstance(instruction, AddTypeHints):
             if instruction.function_name is None:

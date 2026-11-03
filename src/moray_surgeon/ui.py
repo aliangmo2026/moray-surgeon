@@ -19,6 +19,7 @@ from rich.text import Text
 
 from moray_surgeon.schema import (
     AddTypeHints,
+    ConvertToMatchCase,
     ExtractFunction,
     Instruction,
     Noop,
@@ -179,6 +180,8 @@ def _detail(instruction: Instruction) -> str:
         return instruction.function_name or "whole file"
     if isinstance(instruction, ReplaceCall):
         return f"{instruction.old_call} -> {instruction.new_call}"
+    if isinstance(instruction, ConvertToMatchCase):
+        return f"if/elif chain -> match (lines {instruction.start_line}-{instruction.end_line})"
     if isinstance(instruction, Noop):
         return instruction.message
     return ""

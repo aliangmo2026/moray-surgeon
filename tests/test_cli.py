@@ -668,3 +668,100 @@ def test_audit_passes_verifier_options(tmp_path, monkeypatch):
     assert result.exit_code == 0
     assert captured["mypy_target"] == "app"
     assert captured["pytest_args"] == ["-q", "-x"]
+
+
+def _index_repo(tmp_path: Path, name: str = "index-repo") -> Path:
+    """A git repository holding one Python file, like ``_init_git_repo``."""
+    repo = tmp_path / name
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "app.py").write_text("class Widget:\n    pass\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    return repo
+
+
+def test_refactor_help_lists_the_clear_cache_flag():
+    result = runner.invoke(app, ["refactor", "--help"])
+
+    assert result.exit_code == 0
+    assert "--clear-cache" in _output(result)
+
+
+def test_refactor_clear_cache_deletes_the_existing_index(tmp_path, monkeypatch):
+    repo = _index_repo(tmp_path)
+    from moray_surgeon.engine.indexer import CACHE_DIRECTORY, DATABASE_FILENAME, Indexer
+
+    Indexer(repo).refresh()
+    database = repo / CACHE_DIRECTORY / DATABASE_FILENAME
+    assert database.exists()
+    _install_fake_orchestrator(
+        monkeypatch,
+        {},
+        RefactorReport(success=True, attempts=1, plan=None, log=[], last_verify=None),
+    )
+
+    result = runner.invoke(
+        app, ["refactor", "rename x", "--path", str(repo), "--clear-cache"]
+    )
+
+    assert result.exit_code == 0
+    assert "Code index cleared." in _output(result)
+    assert not database.exists()
+
+
+def test_refactor_clear_cache_without_an_index_says_so(tmp_path, monkeypatch):
+    repo = _index_repo(tmp_path)
+    _install_fake_orchestrator(
+        monkeypatch,
+        {},
+        RefactorReport(success=True, attempts=1, plan=None, log=[], last_verify=None),
+    )
+
+    result = runner.invoke(
+        app, ["refactor", "rename x", "--path", str(repo), "--clear-cache"]
+    )
+
+    assert result.exit_code == 0
+    assert "No code index to clear." in _output(result)
+
+
+def test_cache_command_reports_stats(tmp_path):
+    repo = _index_repo(tmp_path)
+    from moray_surgeon.engine.indexer import Indexer
+
+    Indexer(repo).refresh()
+
+    result = runner.invoke(app, ["cache", "--path", str(repo), "--stats"])
+
+    assert result.exit_code == 0
+    output = _output(result)
+    assert "files: 1" in output
+    assert "symbols: " in output
+    assert "index.sqlite3" in output
+
+
+def test_cache_command_clears_the_index(tmp_path):
+    repo = _index_repo(tmp_path)
+    from moray_surgeon.engine.indexer import CACHE_DIRECTORY, DATABASE_FILENAME, Indexer
+
+    Indexer(repo).refresh()
+    database = repo / CACHE_DIRECTORY / DATABASE_FILENAME
+
+    result = runner.invoke(app, ["cache", "--path", str(repo), "--clear-cache"])
+
+    assert result.exit_code == 0
+    assert "Code index cleared." in _output(result)
+    assert not database.exists()
+
+
+def test_cache_command_surfaces_a_cache_error(tmp_path):
+    repo = _index_repo(tmp_path)
+    # A directory where the database file belongs makes the deletion fail, which
+    # is the one error the command has to report instead of ignoring.
+    (repo / ".moray-cache" / "index.sqlite3").mkdir(parents=True)
+
+    result = runner.invoke(app, ["cache", "--path", str(repo), "--clear-cache"])
+
+    assert result.exit_code == 1
+    assert "error:" in _output(result)

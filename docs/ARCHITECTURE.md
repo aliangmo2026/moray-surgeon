@@ -107,17 +107,18 @@ The order is deliberate: the structural gate is cheap, deterministic and runs fi
 
 | Module | Responsibility | Key invariant |
 |---|---|---|
-| `cli.py` | Typer entry points (`refactor`, `audit`, `mcp`, `version`); validates the repo root; renders plan, diff and report | Refuses to start outside a Git work tree (exit `2`); `audit` never writes |
+| `cli.py` | Typer entry points (`refactor`, `audit`, `cache`, `mcp`, `version`); validates the repo root; renders plan, diff and report | Refuses to start outside a Git work tree (exit `2`); `audit` never writes |
 | `audit.py` | Read-only CI gate: git change set → per-file fingerprints vs the base commit → optional scope gate → verification; JSON report | No edit, commit or stash; violations are collected, not raised |
 | `mcp_server.py` | stdio MCP host with three tools; all failures become strings | stdout carries JSON-RPC only; logs go to a file |
-| `orchestrator.py` | Attempt loop, repo-map injection, per-attempt transaction, scope gate, dry-run, diff capture | One transaction per attempt; both gates roll back through the same path |
+| `orchestrator.py` | Attempt loop, repo-map injection, code-index refresh, per-attempt transaction, scope gate, dry-run, diff capture | One transaction per attempt; both gates roll back through the same path; a failed index refresh suspends the cache for that run instead of rebuilding it inside a stash |
 | `intent/parser.py` | Model round-trip through the selected provider, fence stripping, schema + DAG validation, one repair round | Returns typed instructions, never a file body; a bad graph is retryable |
 | `intent/providers.py` | Request/response dialects: Ollama native (`/api/chat`, schema grammar), OpenAI-compatible (`/chat/completions`, JSON mode, bearer auth) and Anthropic Messages (`/v1/messages`, top-level `system`, `x-api-key`) | The API key exists only in a request header — never in `repr`, logs or error messages; redirects are not followed |
 | `schema/instructions.py` | Frozen, closed instruction models with `id`/`depends_on`; discriminated union; Ollama-safe schema inlining | `extra="forbid"`, `frozen=True`, no `$ref` survives inlining |
 | `transaction/manager.py` | Git snapshot, commit and rollback | Failed transaction restores the exact starting state; rollback errors are raised |
 | `engine/dag.py` | Kahn topological sort over `depends_on`; node-level graph validation | Stable order: ready ties follow authored position; invalid graphs never reach a file |
+| `engine/indexer.py` | SQLite symbol table under `.moray-cache/`: `ast` name walk, `(mtime_ns, size, sha256)` incremental refresh, per-file re-index after a write | Read-only analysis (libcst still owns every written byte); only answers *which files mention a name*; unavailable cache degrades to a full scan |
 | `engine/dispatcher.py` | Dependency-ordered execution, path containment, error classification | Sort → resolve → containment → existence, in that order |
-| `engine/rename.py` | Jedi project references → libcst position edits; textual fallback; temporary project-search budget | References outside `repo_root` are never rewritten |
+| `engine/rename.py` | Index candidates → libcst positions → Jedi `goto` verification → libcst edits; project-wide Jedi search and textual rename as fallbacks | References outside `repo_root` are never rewritten; a candidate is only rewritten when Jedi resolves it to one of the target's definitions |
 | `engine/extract.py` | Module-level statements → new function + call site | Only CST body edits; never string slicing or re-parsing |
 | `engine/replace_call.py` | Callee replacement | Arguments, comments and spacing on the `Call` node are preserved |
 | `engine/type_hints.py` | Missing `-> None` annotations | Never guesses a richer type |
@@ -129,7 +130,7 @@ The order is deliberate: the structural gate is cheap, deterministic and runs fi
 
 ## Instruction set
 
-Seven atoms, each a frozen model in the discriminated union. Every atom inherits `id` (required, unique inside the plan) and `depends_on` (default empty) from the shared base; the dispatcher orders the batch on those fields before executing it.
+Thirteen atoms, each a frozen model in the discriminated union. Every atom inherits `id` (required, unique inside the plan) and `depends_on` (default empty) from the shared base; the dispatcher orders the batch on those fields before executing it.
 
 | Action | Effect | Scope |
 |---|---|---|
@@ -139,6 +140,7 @@ Seven atoms, each a frozen model in the discriminated union. Every atom inherits
 | `add_type_hints` | Add a missing `-> None` return annotation | Conservative by design |
 | `add_import` | Add `import x` or `from x import y`, sorted into the import block | Module level only |
 | `remove_import` | Remove an import (or one name from a from-import) | Module level only |
+| `convert_to_match_case` | Rewrite an if/elif/else chain into a Python 3.10+ `match` | Only `==`-with-literal, `isinstance` and `or` of those; refuses anything a pattern cannot express |
 | `noop` | Explicitly declare that no edit is needed | Retried with feedback if the whole plan is `noop` |
 
 ## Data contracts

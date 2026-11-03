@@ -11,6 +11,7 @@ changed.
 
 from __future__ import annotations
 
+from moray_surgeon.engine.convert_match import convert_to_match_case
 from moray_surgeon.engine.dag import topological_sort
 from moray_surgeon.engine.dispatcher import execute_plan
 from moray_surgeon.engine.extract import extract_function
@@ -35,6 +36,7 @@ from moray_surgeon.engine.type_hints import add_type_hints
 __all__ = [
     "add_import",
     "add_type_hints",
+    "convert_to_match_case",
     "execute_plan",
     "extract_function",
     "extract_variable",

@@ -87,6 +87,17 @@ class TransactionManager:
             self._stashed = not _has_harmless_message(snapshot)
         return self
 
+    @property
+    def stashed(self) -> bool:
+        """True while a snapshot of the user's uncommitted work is held.
+
+        Callers use it to decide whether the working tree changed under them when
+        the block was entered — the code index, for instance, is built before the
+        transaction and has to be refreshed when the stash replaced the files it
+        described.
+        """
+        return self._stashed
+
     def commit(self) -> None:
         """Commit the transaction, merging the pre-refactor snapshot back in.
 

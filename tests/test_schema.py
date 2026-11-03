@@ -13,6 +13,7 @@ from moray_surgeon.schema import (
     AddImport,
     AddTypeHints,
     CircularSchemaError,
+    ConvertToMatchCase,
     ExtractFunction,
     ExtractVariable,
     InlineFunction,
@@ -60,6 +61,16 @@ ACTION_SAMPLES: list[tuple[dict[str, Any], type[Any]]] = [
         ExtractFunction,
     ),
     ({"id": "step3", "action": "add_type_hints", "target_file": "pkg/mod.py"}, AddTypeHints),
+    (
+        {
+            "id": "step6",
+            "action": "convert_to_match_case",
+            "target_file": "pkg/mod.py",
+            "start_line": 4,
+            "end_line": 12,
+        },
+        ConvertToMatchCase,
+    ),
     (
         {
             "id": "step4",
@@ -532,6 +543,7 @@ def test_discriminator_mapping_values_are_inlined_dicts() -> None:
         "replace_call",
         "add_import",
         "remove_import",
+        "convert_to_match_case",
         "noop",
     }
     assert set(mapping) == expected_tags

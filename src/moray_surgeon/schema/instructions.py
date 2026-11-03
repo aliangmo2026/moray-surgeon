@@ -103,6 +103,23 @@ class ExtractFunction(_FileInstruction):
     end_line: int = Field(ge=1)
 
 
+class ConvertToMatchCase(_FileInstruction):
+    """Rewrite an if/elif/else chain into a Python 3.10+ ``match`` statement.
+
+    The range must fully contain exactly one chain. Only tests that map onto a
+    pattern are accepted: ``subject == <literal or dotted constant>``,
+    ``isinstance(subject, <class>)`` and ``or`` combinations of those; the engine
+    refuses complex booleans instead of guessing, because a pattern cannot express
+    a conjunction.
+
+    NOTE: start_line <= end_line is enforced by the engine layer, not here.
+    """
+
+    action: Literal["convert_to_match_case"] = "convert_to_match_case"
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+
+
 class ExtractVariable(_FileInstruction):
     """Extract the expression at an exact source range into a new variable.
 
@@ -393,6 +410,7 @@ Instruction = Annotated[
     | ReplaceCall
     | AddImport
     | RemoveImport
+    | ConvertToMatchCase
     | Noop,
     Field(discriminator="action"),
 ]

@@ -26,6 +26,7 @@ leaves every file byte-for-byte untouched.
 from __future__ import annotations
 
 import keyword
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -43,8 +44,19 @@ from libcst.metadata.scope_provider import Assignment
 
 from moray_surgeon.engine.base import EditResult
 from moray_surgeon.engine.import_manager import add_import
+from moray_surgeon.engine.indexer import Indexer, get_indexer
 from moray_surgeon.engine.inline_variable import _python_files
-from moray_surgeon.engine.rename import _jedi_reference_budget
+from moray_surgeon.engine.rename import (
+    _identity,
+    _jedi_reference_budget,
+    _project_scan_is_cheaper,
+    _reindex,
+    _scan_name_positions,
+)
+from moray_surgeon.exceptions import CacheError
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 def move_symbol(
@@ -52,6 +64,7 @@ def move_symbol(
     source_path: Path,
     target_path: Path,
     symbol_name: str,
+    indexer: Indexer | None = None,
 ) -> EditResult:
     """Move the top-level ``symbol_name`` from ``source_path`` to ``target_path``.
 
@@ -61,6 +74,8 @@ def move_symbol(
         target_path: Absolute path of the file the symbol moves to; it must
             already exist.
         symbol_name: Name of the top-level function or class to move.
+        indexer: Optional shared index handle. When omitted the process-wide one
+            for ``repo_root`` is used, so a plan reuses one refresh.
 
     Returns:
         An :class:`EditResult` for ``source_path`` whose ``changes`` counts the
@@ -108,12 +123,14 @@ def move_symbol(
         target_module_name,
         symbol_name,
         name_span,
+        indexer,
     )
 
     source_path.write_text(new_source, encoding="utf-8")
     target_path.write_text(new_target, encoding="utf-8")
     for path, text in rewrites.items():
         path.write_text(text, encoding="utf-8")
+    _reindex(repo_root, indexer, [source_path, target_path, *rewrites])
 
     return EditResult(new_source=new_source, changes=2 + len(rewrites))
 
@@ -339,18 +356,20 @@ def _plan_importer_rewrites(
     target_module_name: str,
     symbol_name: str,
     name_span: CodeRange,
+    indexer: Indexer | None = None,
 ) -> dict[Path, str]:
     """Rewrite every ``from <source> import <symbol>`` in the repository.
 
     Files whose references are not import statements (attribute-style usage)
     refuse the move, computed from Jedi's reference set before anything is
-    written.
+    written. Only files the index says mention the symbol are read: a module that
+    never spells the name cannot contain the import being looked for.
     """
     referencing_files = _referencing_files(
-        repo_root, source_path, target_path, symbol_name, name_span
+        repo_root, source_path, target_path, symbol_name, name_span, indexer
     )
     rewrites: dict[Path, str] = {}
-    for path in _python_files(repo_root):
+    for path in _candidate_files(repo_root, symbol_name, indexer):
         if path.resolve() in (source_path.resolve(), target_path.resolve()):
             continue
         text = path.read_text(encoding="utf-8")
@@ -379,14 +398,118 @@ def _plan_importer_rewrites(
     return rewrites
 
 
+def _candidate_files(
+    repo_root: Path, symbol_name: str, indexer: Indexer | None
+) -> list[Path]:
+    """Files that can contain a rewrite of ``symbol_name``.
+
+    The index answers this from its symbol table; when it is unavailable every
+    Python file in the repository is read, which is what the atom did before the
+    index existed.
+    """
+    try:
+        handle = indexer or get_indexer(repo_root)
+        return list(handle.files_with(symbol_name))
+    except CacheError as exc:
+        logger.warning("code index unavailable (%s); scanning every Python file", exc)
+        return _python_files(repo_root)
+
+
 def _referencing_files(
     repo_root: Path,
     source_path: Path,
     target_path: Path,
     symbol_name: str,
     name_span: CodeRange,
+    indexer: Indexer | None = None,
 ) -> set[Path]:
     """Files Jedi sees using the symbol, source and target excluded."""
+    try:
+        return _indexed_referencing_files(
+            repo_root, source_path, target_path, symbol_name, name_span, indexer
+        )
+    except CacheError as exc:
+        logger.warning("code index unavailable (%s); using a full Jedi scan", exc)
+        return _jedi_referencing_files(
+            repo_root, source_path, target_path, symbol_name, name_span
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"could not verify references for {symbol_name!r} ({exc}); refusing to move"
+        ) from None
+
+
+def _indexed_referencing_files(
+    repo_root: Path,
+    source_path: Path,
+    target_path: Path,
+    symbol_name: str,
+    name_span: CodeRange,
+    indexer: Indexer | None,
+) -> set[Path]:
+    """Resolve every indexed mention of the symbol and keep the real references.
+
+    ``goto(follow_imports=True)`` normalises a mention to the definition it
+    ultimately names, so the comparison is definition-to-definition: ``mod.User``,
+    ``from models import User`` and a bare ``User()`` all resolve to the class and
+    all count, while an unrelated same-named symbol in another module does not.
+    """
+    handle = indexer or get_indexer(repo_root)
+    source_resolved = source_path.resolve()
+    target_resolved = target_path.resolve()
+    candidates = [
+        path
+        for path in handle.files_with(symbol_name)
+        if path.resolve() not in (source_resolved, target_resolved)
+    ]
+    if not candidates:
+        return set()
+    if _project_scan_is_cheaper(handle, candidates):
+        # A symbol used across most of the repository is cheaper to resolve with
+        # one project-wide search than with one inference per occurrence.
+        return _jedi_referencing_files(
+            repo_root, source_path, target_path, symbol_name, name_span
+        )
+
+    files: set[Path] = set()
+    with _jedi_reference_budget(repo_root):
+        project = jedi.Project(path=str(repo_root))
+        source_script = jedi.Script(path=str(source_path), project=project)
+        origins = {
+            _identity(str(source_path), name_span.start.line, name_span.start.column)
+        }
+        for resolved in source_script.goto(
+            name_span.start.line, name_span.start.column, follow_imports=True
+        ):
+            if resolved.module_path is not None:
+                origins.add(_identity(resolved.module_path, resolved.line, resolved.column))
+        for path in candidates:
+            wrapper = MetadataWrapper(cst.parse_module(path.read_text(encoding="utf-8")))
+            scanned = _scan_name_positions(wrapper, symbol_name)
+            if not scanned:
+                continue
+            script = jedi.Script(path=str(path), project=project)
+            for line, column in scanned:
+                if any(
+                    _identity(resolved.module_path, resolved.line, resolved.column) in origins
+                    for resolved in script.goto(
+                        line=line, column=column, follow_imports=True
+                    )
+                    if resolved.module_path is not None
+                ):
+                    files.add(path)
+                    break
+    return files
+
+
+def _jedi_referencing_files(
+    repo_root: Path,
+    source_path: Path,
+    target_path: Path,
+    symbol_name: str,
+    name_span: CodeRange,
+) -> set[Path]:
+    """Project-wide Jedi reference search; the pre-index implementation."""
     try:
         with _jedi_reference_budget(repo_root):
             project = jedi.Project(path=str(repo_root))

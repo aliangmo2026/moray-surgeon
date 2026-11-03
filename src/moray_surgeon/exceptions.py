@@ -72,6 +72,15 @@ class GitError(MorayError):
         self.stderr = stderr
 
 
+class CacheError(MorayError):
+    """The local code index could not be opened, read or written.
+
+    The index only ever narrows a search, so callers degrade to a full scan
+    instead of failing: a read-only checkout, a locked database or a directory
+    that is really a file must not stop a refactor.
+    """
+
+
 class ScopeViolationError(MorayError):
     """Raised when an attempt changed AST nodes its plan did not authorise.
 

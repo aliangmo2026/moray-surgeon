@@ -6,8 +6,8 @@
 
 *The model writes no code. It writes a plan. `libcst` does the surgery.*
 
-[![Tests](https://img.shields.io/badge/Tests-441%20passed-brightgreen)](#engineering-standards)
-[![Coverage](https://img.shields.io/badge/Coverage-97%25-brightgreen)](#engineering-standards)
+[![Tests](https://img.shields.io/badge/Tests-780%20passed-brightgreen)](#engineering-standards)
+[![Coverage](https://img.shields.io/badge/Coverage-94%25-brightgreen)](#engineering-standards)
 [![Ruff](https://img.shields.io/badge/Ruff-0%20warnings-blue)](#engineering-standards)
 [![Plans](https://img.shields.io/badge/Plans-DAG%20ordered-blueviolet)](#dependency-aware-plans-dag)
 [![CI Gateway](https://img.shields.io/badge/CI-PR%20gateway-2088FF?logo=githubactions&logoColor=white)](#use-as-a-ci-gateway)
@@ -58,10 +58,10 @@ moray-surgeon 是一个「零幻觉」代码重构引擎：大模型只负责把
 
 ## Features
 
-- 🛡️ **Zero-hallucination, schema-driven.** The model can only emit one of seven instructions, validated against a frozen Pydantic model; on the Ollama path the same JSON Schema is sent as the `format` decoding grammar, constraining generation rather than just checking afterwards.
+- 🛡️ **Zero-hallucination, schema-driven.** The model can only emit one of the thirteen instructions below, validated against a frozen Pydantic model; on the Ollama path the same JSON Schema is sent as the `format` decoding grammar, constraining generation rather than just checking afterwards.
 - 🔪 **AST precision with `libcst`.** Edits are CST node transformations, not string replacement or `ast.unparse`. Comments, blank lines, quote style, indent width and untouched expressions round-trip byte-for-byte.
 - 🔗 **Dependency-aware plans (DAG).** Every instruction carries a unique `id` and may list `depends_on`. Before the first file is read, `execute_plan` runs Kahn's algorithm over the plan: rename a class before rewriting its callers, add the import before the call that needs it. A plan with no edges keeps v0.2.0's authored-order semantics; duplicate ids, dangling references and cycles are rejected before any edit.
-- 🕵️‍♂️ **Jedi cross-file resolution.** `rename_symbol` resolves references at project scope, so renaming a function updates its callers across files without touching same-named attributes or keyword arguments. The atom raises Jedi's built-in 30-file search budget to the repository size, so large projects are not silently half-renamed.
+- 🕵️‍♂️ **Jedi cross-file resolution.** `rename_symbol` resolves references at project scope, so renaming a function updates its callers across files without touching same-named attributes or keyword arguments. A local [SQLite code index](#large-project-performance-the-code-index) narrows the search to the files that mention the symbol, so a rename on a 2,000-module project costs ~0.2 s instead of ~23 s — without weakening Jedi's verdict on a single site.
 - 🛑 **Git transaction and rollback.** Every attempt enters a transaction: uncommitted work is snapshotted with `git stash -u`, the refactor is committed only on a green verification, and any failure runs `git reset --hard HEAD` plus `git clean -fd`, then restores your snapshot.
 - 🧭 **AST scope guard (the second safety net).** Before the plan runs, every Python file is fingerprinted (per-class, per-function, per-module-level statement). After it runs, every changed node must be explained by the plan — a renamed symbol, a Jedi reference site, or a file-global atom. Anything else raises `ScopeViolationError`, rolls the attempt back and feeds the offending node names to the next prompt.
 - 📦 **Controlled imports.** `add_import` and `remove_import` edit the import block through typed fields (module path + identifier), never free-form source. Imports are merged into the right statement, sorted with isort's `order-by-type` rule, wrapped when a line would exceed 88 characters, and never reorder unrelated statements.
@@ -89,6 +89,7 @@ moray-surgeon 是一个「零幻觉」代码重构引擎：大模型只负责把
 | `add_type_hints` | Add a missing `-> None` return annotation | Conservative by design |
 | `add_import` | Add `import x` / `from x import y`, sorted into the import block | Module level, absolute modules |
 | `remove_import` | Drop an import, or one name from a from-import | Module level, absolute modules |
+| `convert_to_match_case` | Rewrite an if/elif/else chain into a `match` statement | Python 3.10+; refuses `and`/`not`, non-`==` tests and subjects a branch rebinds |
 | `noop` | Explicitly declare that no edit is needed | Retried with feedback if the whole plan is `noop` |
 
 Every instruction also carries a unique `id` and an optional `depends_on` list; see the next section.
@@ -163,6 +164,68 @@ python tests/stress_test/run_bombing.py --keep
 ```
 
 The project is regenerated from a checked-in template each run, so the evidence is not a one-off checkout.
+
+## Large-project performance: the code index
+
+`rename_symbol` and `move_symbol` are the only project-aware atoms. Before the index existed they asked Jedi for *project-scope* references with the per-search file budget raised to the size of the repository (raising it is what keeps the search complete past Jedi's 30-file default). Correct, but the cost grew with the repository: on a 2,000-module project a single rename spent around half a minute locating references.
+
+The engine now keeps a symbol table in SQLite and asks it the only question Jedi cannot answer cheaply — *which files mention this identifier at all?*
+
+```text
+<repo>/.moray-cache/index.sqlite3     name, kind, scope chain, file, line for every identifier
+```
+
+For each rename the atom now:
+
+1. asks the index for the files that contain the symbol;
+2. parses only those files with libcst to get exact positions;
+3. asks Jedi to resolve each position (`goto(follow_imports=True)`) and keeps it only when it lands on one of the symbol's definitions;
+4. rewrites with libcst, then re-indexes the files it wrote.
+
+Jedi still decides every edit. The index proposes candidates only, so a stale row can drop a candidate — never rewrite a symbol it does not own. The rewrite set is identical to what the old project-wide search produced: everything that resolves to one of the target's definitions is rewritten, `obj.Symbol` attribute lookups and `kwarg=Symbol` keyword arguments are left alone, and a renamed import alias does not drag the original definition along.
+
+The atom also chooses its strategy with the index: a symbol concentrated in a minority of the files is verified position by position (the common case, and the one the index makes cheap), while a symbol spread across most of the repository is resolved by one project-wide search, which shares its inference instead of paying it per occurrence. On a project whose modules carry rich import graphs the per-position path was measured 3.8× slower once a symbol appeared in 53 of 59 files; the cutoff keeps that case on the proven path.
+
+### Measured
+
+`python scripts/bench_index.py` builds a fresh repository per measurement (Jedi caches parsed modules per process, so timing twice on one tree measures the cache, not the algorithm) and times a **complete rename** on both sides, so the only difference is how the references are found. Synthetic modules on Windows 11 / CPython 3.12.2:
+
+| Modules | Files | Before index | Index build (once) | Indexed rename | Speedup |
+|---|---|---|---|---|---|
+| 200 | 204 | 3.43 s | 0.87 s | **0.38 s** | 9.0× |
+| 800 | 804 | 14.00 s | 7.95 s | **0.45 s** | 31.5× |
+| 2,000 | 2,004 | 30.78 s | 24.78 s | **0.37 s** | 83.5× |
+
+The indexed number is flat because it only touches the handful of files that mention the symbol; the build is paid once per repository and amortised over every later rename. The build figures include the cold filesystem and antivirus cost of writing a new database per temporary tree — the same tree refreshed again is a stat walk (~0.02 ms/file) plus one parse per changed file.
+
+### Incremental refresh
+
+The orchestrator refreshes the index **before** it opens a transaction, and again inside the transaction when the stash replaced the user's worktree (the stash reverts files, so the index built a moment earlier describes content that is no longer on disk). A refresh:
+
+- stats every Python file (≈0.02 ms/file) and re-parses only files whose `mtime_ns` or size moved;
+- hashes the file when the mtime moved, so a `touch` that leaves the content identical updates the row without a parse;
+- drops the rows of deleted files;
+- re-indexes exactly the files the engine itself wrote (`Indexer.reindex`), so the next instruction in the same plan sees the new symbols.
+
+Symbol extraction is a read-only pass over the standard library `ast` (0.5 ms/file here, against 23.4 ms/file for a libcst `PositionProvider` pass). libcst remains the only thing that produces bytes: every position and every rewrite still comes from libcst, which is also why the index stores no columns — positions are recomputed on candidate files with libcst and therefore cannot drift from the ones being rewritten.
+
+### When the cache is unavailable
+
+The index is an accelerator, never a dependency:
+
+- a read-only checkout, a locked database or a cache path that cannot be created makes the atoms fall back to the project-wide Jedi scan;
+- the orchestrator then **suspends** the index for that run instead of rebuilding it inside the transaction — recreating `.moray-cache/` while a stash holds it would make `git stash apply` refuse to restore the user's files;
+- `.moray-cache/` is added to `.git/info/exclude` (not `.gitignore`) the first time it is created, so it is never committed, never stashed and never removed by `git clean -fd`.
+
+### Managing the cache
+
+```bash
+moray-surgeon refactor "..." --path . --clear-cache   # rebuild from scratch before running
+moray-surgeon cache --path . --stats                  # files, symbols, database size
+moray-surgeon cache --path . --clear-cache            # delete it; the next refactor rebuilds it
+```
+
+Nothing is lost by clearing: every row is derived from the sources.
 
 ## Quick start
 
@@ -253,6 +316,7 @@ moray-surgeon refactor "Rename parse_args to parse_cli_options" --path . --files
 | `--mypy-target` | `src` | Path passed to `mypy` |
 | `--pytest-args` | `-q` | Arguments passed to `pytest` |
 | `--dry-run` | off | Show the diff and roll back without committing |
+| `--clear-cache` | off | Delete the [code index](#large-project-performance-the-code-index) and rebuild it before running |
 
 Exit codes: `0` success, `1` refactor or verification failure, `2` not a Git repository. The read-only [`audit`](#use-as-a-ci-gateway) command has its own flags and exit codes.
 
@@ -404,8 +468,8 @@ To enforce an authorising plan in CI, add `--plan moray-plan.json` and commit th
 
 | Gate | Result |
 |---|---|
-| Test suite | **441 passed** |
-| Coverage | **97%** (enforced gate: 90%) |
+| Test suite | **780 passed** |
+| Coverage | **94%** (enforced gate: 90%) |
 | Lint | **Ruff: 0 warnings** |
 | Stress test | **PASS** — 50 instructions on 8,046 lines / 300 classes, 54 files changed |
 | Runtime | Python 3.11+ (verified on CPython 3.12.2) |
@@ -417,7 +481,7 @@ Safety is part of the test surface, not an afterthought: path containment is che
 ## Known limitations
 
 1. **Controlled imports have a deliberate scope.** `add_import`/`remove_import` only touch top-level statements; imports inside `try:` blocks or functions are left alone. `module` must be an absolute dotted path (relative imports are never generated or merged). Existing statements are never reordered — only a merged alias list is sorted. A rename that unsorts a from-import is the project's isort gate's concern, not a silent engine reformat.
-2. **`rename_symbol` is best-effort outside Jedi's view.** The atom raises Jedi's project-search budget to the repository's file count, but if Jedi cannot analyse the project it falls back to a single-file textual rename and logs a warning.
+2. **`rename_symbol` is best-effort outside Jedi's view.** Candidates come from the local [code index](#large-project-performance-the-code-index) and every one of them is resolved by Jedi before it is rewritten; if the index cannot be used the atom falls back to Jedi's project-wide search, and if Jedi itself cannot analyse the project it falls back to a single-file textual rename and logs a warning.
 3. **`extract_function` is top-level only.** Nested scopes are not extracted, and a compound statement between the selected lines makes the atom refuse rather than silently reorder code.
 4. **`add_type_hints` only writes `-> None`.** Parameter hints and richer return types are not guessed: a wrong hint is worse than a missing one.
 5. **The scope guard is structural, not semantic.** It allows every node the plan names (and, for a class rename, its members) and every file-global atom in its target file. Two same-named members in different scopes can therefore not be told apart; the verification gates still cover behaviour. It is on by default and can only be disabled programmatically (`Orchestrator(..., scope_guard=False)`), never by the model.
@@ -429,6 +493,8 @@ Safety is part of the test surface, not an afterthought: path containment is che
 11. **Cloud models do not get grammar-constrained decoding.** The OpenAI-compatible path sends `response_format={"type": "json_object"}`; the Anthropic Messages path has neither a grammar nor a JSON-mode switch. Both rely on the system prompt plus validation; a model that ignores the schema costs a repair round or an attempt. Ollama's `format` grammar remains the strongest guarantee.
 12. **Cloud authentication is header-based and single-credential.** `openai` sends `Authorization: Bearer`, `anthropic` sends `x-api-key` plus `anthropic-version`. Base URLs with embedded credentials or query strings are rejected (the token belongs in `api_key`), redirects are not followed, and endpoints that need an API version in the query string (Azure-style) are not supported out of the box.
 13. **Provider flags are CLI-only.** The MCP tools keep the local Ollama defaults; a cloud provider is configured through `moray-surgeon refactor`.
+14. **The code index is a candidate oracle, not a compiler.** It records identifiers per file, not types or bindings: a symbol that only appears inside a string or comment is (correctly) never a candidate, and keyword arguments are excluded on purpose because Jedi does not treat them as references to the parameter. Correctness never depends on the index being right — it only changes which files Jedi is asked about, and an unusable cache degrades to a full scan.
+15. **Line ranges in a plan are absolute.** `convert_to_match_case`, `extract_function` and `extract_variable` address the file as it exists when their step runs, so two range-based steps in the *same* file interact: converting a chain near the top shifts the lines of everything below it. Order such steps bottom-up (or `depends_on` them across files) when a plan touches two ranges in one file. `convert_to_match_case` refuses a range that no longer covers a whole chain instead of guessing which one was meant.
 
 ## License and contact
 

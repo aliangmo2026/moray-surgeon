@@ -136,6 +136,15 @@ Fields: `module` (dotted path), `name` (string or null).
 `name` null removes every import of `module`; otherwise only that name is
 dropped from `from module import ...` statements.
 
+## convert_to_match_case
+Rewrite one complete if/elif/else chain into a Python 3.10+ `match` statement.
+Fields: `start_line`, `end_line` (1-based); the range must fully contain exactly
+one chain. Only tests that map onto a pattern are accepted: `subject == <literal
+or dotted constant>`, `isinstance(subject, <class>)` and `or` combinations of
+those. `and`, `not`, non-`==` comparisons, calls or subscripts as the subject and
+branches that rebind the subject are refused: a pattern cannot express them, and
+a wrong rewrite would change behaviour.
+
 ## noop
 Explicitly do nothing. Use it when the intent requires no edit.
 Fields: `message` (optional).
