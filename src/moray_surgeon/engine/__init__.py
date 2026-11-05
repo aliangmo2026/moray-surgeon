@@ -11,6 +11,12 @@ changed.
 
 from __future__ import annotations
 
+from moray_surgeon.engine.backends import (
+    LanguageBackend,
+    PythonBackend,
+    backend_for,
+    register_backend,
+)
 from moray_surgeon.engine.convert_match import convert_to_match_case
 from moray_surgeon.engine.dag import topological_sort
 from moray_surgeon.engine.dispatcher import execute_plan
@@ -34,8 +40,11 @@ from moray_surgeon.engine.split_class import split_class
 from moray_surgeon.engine.type_hints import add_type_hints
 
 __all__ = [
+    "LanguageBackend",
+    "PythonBackend",
     "add_import",
     "add_type_hints",
+    "backend_for",
     "convert_to_match_case",
     "execute_plan",
     "extract_function",
@@ -45,6 +54,7 @@ __all__ = [
     "inline_function",
     "inline_variable",
     "move_symbol",
+    "register_backend",
     "remove_dead_code",
     "remove_import",
     "rename_symbol",

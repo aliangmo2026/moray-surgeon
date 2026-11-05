@@ -20,6 +20,11 @@ dependencies = [
     "httpx>=0.27",
     "mcp>=1.0.0",
     "jedi>=0.19.0",
+    "pygls>=1.3.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+    # GitHub Issue bot: issue/PR API access for `moray-surgeon bot`.
+    "PyGithub>=2.3.0",
 ]
 
 [project.optional-dependencies]
@@ -41,6 +46,11 @@ moray-surgeon = "moray_surgeon.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The web console ships its single-page UI as a static asset next to the
+# web_server module; without this block the wheel would serve a 404 landing page.
+[tool.setuptools.package-data]
+moray_surgeon = ["static/*.html"]
 
 # Single source of truth lives in moray_surgeon/__init__.py; duplicating the
 # version string here would let the wheel metadata silently drift.
@@ -67,7 +77,10 @@ module = "moray_scribe.*"
 ignore_missing_imports = true
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "N", "UP", "ANN", "B", "SIM", "RUF"]
+# S102 is selected on purpose: the differential sandbox is the one place where
+# executing code is the job, and the single call site carries a noqa + threat
+# model instead of hiding behind a blanket ignore.
+select = ["E", "F", "W", "I", "N", "UP", "ANN", "B", "SIM", "RUF", "S102"]
 
 # Fixture factories and helpers in tests are intentionally duck-typed; the
 # typed surface is enforced on src/ only.
@@ -94,3 +107,13 @@ omit = ["*/__main__.py"]
 [tool.coverage.report]
 show_missing = true
 fail_under = 90
+# The differential sandbox runs its worker loop under a custom sys.settrace
+# handler (the opcode watchdog), which by CPython's rules replaces coverage's
+# tracer for that thread. The worker/tracer lines are exercised by every
+# sandbox test but are physically unmeasurable while the watchdog is
+# installed, so their defining lines are excluded like __main__ shims are.
+exclude_lines = [
+    "pragma: no cover",
+    "def worker\\(\\) -> None:",
+    "def tracer\\(frame: FrameType",
+]

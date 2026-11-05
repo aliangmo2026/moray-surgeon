@@ -11,6 +11,13 @@ plan and proves afterwards that only nodes the plan authorises changed; a
 violation is treated exactly like a red gate (rollback + retry with feedback), so
 a plan can never quietly rewrite a function it never mentioned.
 
+A third, best-effort gate runs after a green verification: the **differential
+gate** executes every function whose body changed, before and after, in an
+in-process sandbox (restricted builtins, import allowlist, opcode/wall-clock
+budget) on identical inputs. A proven behavioural difference rolls the attempt
+back; functions the sandbox cannot verify are logged as skips and never block
+the commit.
+
 When an attempt fails, the worktree diff is captured *before* the rollback and
 handed to the next parse together with the verification feedback. The model then
 sees both what it changed and why it broke, while the repository it plans against
@@ -49,9 +56,15 @@ from moray_surgeon.engine.scope_guard import (
 )
 from moray_surgeon.exceptions import CacheError, ScopeViolationError
 from moray_surgeon.intent import IntentParser
-from moray_surgeon.schema import Noop, RefactorPlan
+from moray_surgeon.schema import MoveSymbol, Noop, RefactorPlan
 from moray_surgeon.transaction import TransactionManager
 from moray_surgeon.verify import Verifier, VerifyResult
+from moray_surgeon.verify.differential import (
+    VERDICT_EQUIVALENT,
+    VERDICT_SKIPPED,
+    changed_function_names,
+    compare_functions,
+)
 
 if TYPE_CHECKING:
     from moray_surgeon.ui import LiveTrace
@@ -150,6 +163,7 @@ class Orchestrator:
         max_attempts: int = 3,
         trace: LiveTrace | None = None,
         scope_guard: bool = True,
+        differential: bool = True,
     ) -> None:
         """Store collaborators; the orchestrator owns no I/O of its own.
 
@@ -162,12 +176,17 @@ class Orchestrator:
             scope_guard: Fingerprint the repository before each attempt and
                 reject changes outside the plan. Disable only for a deliberately
                 out-of-scope emergency; it is the second safety gate.
+            differential: After a green verification, run the in-process
+                differential sandbox on every function whose body changed and
+                reject the attempt when behaviour drifted. Skips (impure or
+                sandbox-incompatible functions) never block the commit.
         """
         self._parser = parser
         self._verifier = verifier
         self._max_attempts = max_attempts
         self._trace = trace
         self._scope_guard = scope_guard
+        self._differential = differential
 
     def run(
         self,
@@ -274,6 +293,9 @@ class Orchestrator:
                     with trace.step("Recording architecture snapshot (moray-scribe)..."):
                         before_architecture = _capture_architecture_safely(repo_root, trace)
                     with trace.step("Applying AST instructions..."):
+                        # Differential evidence needs the pre-surgery bytes; the
+                        # stash has already settled the baseline at this point.
+                        original_sources = _capture_original_sources(plan, repo_root)
                         log = execute_plan(plan, repo_root)
                     trace.success(f"Plan applied. Modified {modified} file(s).")
                     if scope_snapshot is not None:
@@ -290,6 +312,8 @@ class Orchestrator:
                         failure = _VerificationFailed(verify, _capture_diff(repo_root))
                         trace.error("Test failed! Rollback initiated.")
                         raise failure
+                    if self._differential:
+                        _run_differential_gate(original_sources, repo_root, trace)
                     # All gates green, commit pending: compare the architecture
                     # against the pre-refactor snapshot. A capture failure (or a
                     # missing moray-scribe) leaves the diff empty.
@@ -414,6 +438,88 @@ def _verify_scope_gate(
             ),
             _capture_diff(repo_root),
         ) from exc
+
+
+def _capture_original_sources(plan: RefactorPlan, repo_root: Path) -> dict[str, str]:
+    """Pre-surgery text of every file the plan may touch.
+
+    Read inside the transaction (after the stash settles), so the text matches
+    the baseline the plan edits. Files that cannot be read are simply absent:
+    the differential gate skips what it cannot compare.
+    """
+    files: set[str] = set()
+    for instruction in plan.instructions:
+        if isinstance(instruction, Noop):
+            continue
+        if isinstance(instruction, MoveSymbol):
+            files.update((instruction.source_file, instruction.target_file))
+            continue
+        files.add(instruction.target_file)
+    originals: dict[str, str] = {}
+    for relative in sorted(files):
+        try:
+            originals[relative] = (repo_root / relative).read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return originals
+
+
+def _run_differential_gate(
+    original_sources: dict[str, str],
+    repo_root: Path,
+    trace: LiveTrace | _NullTrace,
+) -> None:
+    """Runtime-equivalence gate on functions whose bodies the refactor changed.
+
+    Best effort by design: functions the sandbox cannot verify (I/O, globals,
+    methods, blocked imports, budget exhaustion) are logged as skips and never
+    block the commit. A proven behavioural difference, though, is treated
+    exactly like a red pytest gate: rollback plus retry with the mismatch as
+    feedback.
+
+    Raises:
+        _VerificationFailed: A changed function returned different results for
+            identical inputs.
+    """
+    for target_file, original_text in sorted(original_sources.items()):
+        try:
+            current_text = (repo_root / target_file).read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if current_text == original_text:
+            continue
+        try:
+            changed = changed_function_names(original_text, current_text)
+        except Exception:
+            trace.info(f"Differential: could not compare {target_file}; skipping the file.")
+            continue
+        for name in changed:
+            result = compare_functions(original_text, current_text, name)
+            if result.verdict == VERDICT_SKIPPED:
+                trace.info(f"Differential: skipped '{name}' ({result.detail}).")
+                continue
+            if result.verdict == VERDICT_EQUIVALENT:
+                trace.success(
+                    f"Differential: '{name}' is behaviourally equivalent "
+                    f"({result.trials} trial(s))."
+                )
+                continue
+            trace.error(f"Differential mismatch in '{name}'! Rollback initiated.")
+            raise _VerificationFailed(
+                VerifyResult(
+                    ok=False,
+                    stage="differential",
+                    stdout=(
+                        f"Differential execution found that '{name}' in {target_file} behaves "
+                        "differently after the refactor.\n"
+                        f"{result.detail}\n"
+                        "The inputs were identical, so the plan changed runtime semantics. "
+                        "Produce a plan that keeps the function's original behaviour for "
+                        "the same inputs."
+                    ),
+                ),
+                _capture_diff(repo_root),
+            )
 
 
 def _capture_diff(repo_root: Path) -> str:

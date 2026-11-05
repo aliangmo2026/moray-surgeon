@@ -1,3 +1,16 @@
+"""The wire protocol: language-agnostic refactor instructions.
+
+This module is the contract between the model and the engine, and it must stay
+free of any language binding: no imports from the engine, no mention of libcst,
+Jedi or any other toolchain. Field semantics are defined in language-neutral
+terms — ``target_file`` is a repository-relative path, ``start_line``/
+``end_line`` are 1-based inclusive line numbers, columns are absolute character
+offsets, ``module`` is a dotted path — and each
+:class:`~moray_surgeon.engine.backends.base.LanguageBackend` interprets those
+semantics for its own language. A plan that is valid here is valid for every
+backend that registers itself.
+"""
+
 from __future__ import annotations
 
 import copy
@@ -67,15 +80,18 @@ class _FileInstruction(_BaseInstruction):
     @field_validator("target_file")
     @classmethod
     def _validate_target_file(cls, value: str) -> str:
-        """Reject non-.py, absolute and traversal paths; return POSIX form.
+        """Reject absolute and traversal paths; return POSIX form.
 
         `Path.anchor` is checked instead of only `is_absolute()` because on
         Windows a rooted path like "/abs/x.py" is not "absolute" but must
         still be rejected.
+
+        The suffix is deliberately *not* checked: the protocol is
+        language-agnostic, and which suffixes are refactorable is the backend
+        registry's decision, enforced by the dispatcher with
+        UnsupportedLanguageError before any byte is read.
         """
         path = Path(value)
-        if path.suffix != ".py":
-            raise ValueError("target_file must end with .py")
         if ".." in path.parts:
             raise ValueError("target_file must not contain '..'")
         if path.anchor:
@@ -217,10 +233,8 @@ class MoveSymbol(_BaseInstruction):
     @field_validator("source_file", "target_file")
     @classmethod
     def _validate_files(cls, value: str) -> str:
-        """Both endpoints obey the same rules as every other target_file."""
+        """Both endpoints obey the same language-neutral rules as target_file."""
         path = Path(value)
-        if path.suffix != ".py":
-            raise ValueError("source_file and target_file must end with .py")
         if ".." in path.parts:
             raise ValueError("source_file and target_file must not contain '..'")
         if path.anchor:

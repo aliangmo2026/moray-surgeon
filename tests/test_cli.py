@@ -765,3 +765,56 @@ def test_cache_command_surfaces_a_cache_error(tmp_path):
 
     assert result.exit_code == 1
     assert "error:" in _output(result)
+
+
+def test_bot_command_prints_the_pull_request(monkeypatch):
+    from moray_surgeon import bot as bot_module
+    from moray_surgeon.bot import BotResult
+
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(
+        bot_module,
+        "run_github_bot",
+        lambda issue, repo, **kwargs: BotResult(
+            success=True,
+            issue_number=issue,
+            branch=f"moray-bot/issue-{issue}",
+            pull_request_url="https://github.com/acme/widgets/pull/9",
+        ),
+    )
+
+    result = runner.invoke(app, ["bot", "--issue", "7", "--repo", "acme/widgets"])
+
+    assert result.exit_code == 0
+    assert "pull request: https://github.com/acme/widgets/pull/9" in _output(result)
+
+
+def test_bot_command_reports_a_stopped_run(monkeypatch):
+    from moray_surgeon import bot as bot_module
+    from moray_surgeon.bot import BotResult
+
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(
+        bot_module,
+        "run_github_bot",
+        lambda issue, repo, **kwargs: BotResult(
+            success=False,
+            issue_number=issue,
+            branch=f"moray-bot/issue-{issue}",
+            message="verification failed at pytest",
+        ),
+    )
+
+    result = runner.invoke(app, ["bot", "--issue", "7", "--repo", "acme/widgets"])
+
+    assert result.exit_code == 1
+    assert "bot stopped: verification failed at pytest" in _output(result)
+
+
+def test_bot_command_requires_a_github_token(monkeypatch):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    result = runner.invoke(app, ["bot", "--issue", "7", "--repo", "acme/widgets"])
+
+    assert result.exit_code == 1
+    assert "GITHUB_TOKEN is required" in _output(result)

@@ -231,10 +231,13 @@ def test_edit_result_is_frozen() -> None:
 
 
 def test_engine_package_exposes_the_atoms_and_dispatcher() -> None:
-    """The package re-exports every atom, the repo map and the executor."""
+    """The package re-exports every atom, the backend seam and the executor."""
     assert set(engine_package.__all__) == {
+        "LanguageBackend",
+        "PythonBackend",
         "add_import",
         "add_type_hints",
+        "backend_for",
         "convert_to_match_case",
         "execute_plan",
         "extract_function",
@@ -244,6 +247,7 @@ def test_engine_package_exposes_the_atoms_and_dispatcher() -> None:
         "inline_function",
         "inline_variable",
         "move_symbol",
+        "register_backend",
         "split_class",
         "remove_dead_code",
         "remove_import",

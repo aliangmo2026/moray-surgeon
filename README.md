@@ -68,6 +68,8 @@ moray-surgeon 是一个「零幻觉」代码重构引擎：大模型只负责把
 - 🔄 **Auto-fix loop.** On a red gate (behavioural *or* structural) the worktree diff and the diagnostics are captured before rollback and fed into the next plan request. The next attempt re-plans from a clean tree, up to `--max-attempts` rounds (default 3).
 - 🧠 **Bring your own model.** Run against a local Ollama daemon or any OpenAI-compatible or Anthropic-compatible cloud API (DeepSeek, Xiaomi Token Plan, Claude, vLLM, LM Studio, ...). Only the wire format changes: validation, repair, transactions and both gates are identical. The API key comes from `MORAY_API_KEY` (or `--api-key`), is never logged or echoed, and is never forwarded across a redirect.
 - 🔌 **MCP ready.** A stdio MCP server exposes the engine to Cursor, Claude Desktop and any MCP host: list actions, execute a structured plan, or run the full natural-language loop.
+- 🖱️ **LSP code actions.** `moray-surgeon lsp` is a Language Server: extract, inline, match-case conversion, type hints and dead-code removal show up as editor refactor actions, plus an AI-driven action for everything else. The result arrives as a `WorkspaceEdit` you review and save — the engine applies to disk and restores it, so nothing is committed behind your back.
+- ⚖️ **Differential testing.** After pytest passes, every function whose body changed is executed before and after the refactor inside an in-process sandbox (restricted builtins, import allowlist, opcode + wall-clock watchdog) on identical inputs. A proven behavioural difference rolls the attempt back; functions the sandbox cannot verify are logged as skips, never silent passes.
 - 🧪 **Dry run.** `--dry-run` applies the plan inside the transaction, prints a syntax-highlighted unified diff, and rolls back without verifying or committing.
 - 🚦 **CI gateway.** `moray-surgeon audit` is the read-only counterpart of the refactor loop: it diffs the working tree against a base ref, re-fingerprints every changed Python file, applies the same scope gate when a plan is supplied, and runs `ruff`/`mypy`/`pytest` — then exits non-zero with a JSON report. No edit, no commit, no stash.
 - 💥 **Proven under load.** An 8,046-line, 300-class synthetic project survived a 50-instruction single-transaction refactor; two poisoned-instruction runs rolled back in under 0.1 s. [Full report with diffs and timings](./docs/STRESS_TEST_REPORT.md).
@@ -227,6 +229,27 @@ moray-surgeon cache --path . --clear-cache            # delete it; the next refa
 
 Nothing is lost by clearing: every row is derived from the sources.
 
+### Parallel execution across cores
+
+libcst parsing and rewriting are CPU-bound functions of one file's text, so a plan that edits many files does not have to run on one core. The dispatcher batches **consecutive, file-disjoint, dependency-free instructions whose atoms touch nothing but their own target** — `add_import`, `add_type_hints`, `convert_to_match_case`, `extract_function`, `extract_variable`, `remove_import`, `replace_call`, `split_class` — and applies them in a `ProcessPoolExecutor`. Project-aware atoms (`rename_symbol`, `move_symbol`, `inline_variable`, `inline_function`, `remove_dead_code`) read the rest of the project to prove safety, so they run in the parent as barriers; a worker would either see a stale tree or race the parent's writes.
+
+Workers never write. The parent collects every result, rejects a batch if any instruction changed nothing, and only then writes the files — each through a temp-file-plus-rename — so a failing worker cancels the rest and leaves the whole batch untouched (`ConcurrencyError`, rolled back by the transaction like any other engine error).
+
+The pool size is `MORAY_MAX_WORKERS`, defaulting to `min(cpu_count, 8)`; `1` disables the pool and every run stays in-process.
+
+```bash
+python scripts/bench_concurrency.py --files 10 --functions 1200 --repeat 2
+```
+
+Measured on Windows 11 / CPython 3.12.2 / 16 logical cores, 10 modules × 4,800 lines:
+
+| Run | Wall time | Speedup |
+|---|---|---|
+| sequential (`max_workers=1`) | 5.79 s | 1.00× |
+| process pool (8 workers) | **2.83 s** | **2.04×** |
+
+Both runs produce byte-identical files (the script checks this before reporting). Process startup is not free: on ten 240-line modules the same pool is ~3× *slower* than one process (0.39 s → 1.34 s), because spawn costs more than the whole refactor. Parallelism pays off once per-file work dominates that fixed cost.
+
 ## Quick start
 
 **Requirements:** Python 3.11+, Git, and either a local [Ollama](https://ollama.com/) instance or a cloud API (OpenAI- or Anthropic-compatible). The default local path keeps the code and the model on your machine; nothing is sent anywhere.
@@ -351,6 +374,123 @@ The same `mcpServers` block works for Claude Desktop's `claude_desktop_config.js
 
 Two operational notes: the MCP tools do not build a code map, so name the files and symbols in the intent; and they use the default verification profile (`mypy src`, `pytest -q`). For a repository without a `src/` directory, use the CLI, where `--mypy-target` and `--pytest-args` are configurable.
 
+## LSP integration (editors)
+
+`moray-surgeon lsp` runs a [Language Server](https://microsoft.github.io/language-server-protocol/) over stdio. Instead of a chat window, refactors appear as **code actions**: select code (or place the cursor), open the *Refactor...* menu, and pick a moray-surgeon action.
+
+### What it offers
+
+| Action | Trigger | Engine instruction |
+|---|---|---|
+| Extract selection to function | multi-line selection | `extract_function` |
+| Extract expression to variable | any selection | `extract_variable` |
+| Convert if/elif chain to match-case | cursor on an `if`/`elif`/`else` header | `convert_to_match_case` |
+| Inline variable / Inline function | cursor on the name | `inline_variable` / `inline_function` |
+| Remove dead code | cursor on the `def`/`class` line | `remove_dead_code` |
+| Add type hints | cursor on a `def` line, or file-wide | `add_type_hints` |
+| Refactor with AI (moray-surgeon) | always available | natural language → `IntentParser` |
+
+**Preview-first architecture:** when you pick an action, the engine applies the plan to the files on disk, captures the result, and immediately restores the original bytes. What you receive is a `WorkspaceEdit` applied to your editor buffers — you review it, edit it, and save (or undo) yourself. No git state is touched, nothing is committed, and `execute_plan`'s refusal paths (unprovable match-case, non-SSA inlines, dead code with live references) become editor messages instead of rollbacks.
+
+Two safety rules follow from the engine reading files from disk:
+
+1. If an open Python file inside the project differs from its saved copy, the action is refused with a *save your files first* message.
+2. The AI action needs a reachable model: a local Ollama daemon (`ollama serve`, `ollama pull qwen2.5-coder:7b`) or a cloud API configured at startup. When it cannot connect you get a `window/showMessage` with setup steps instead of a broken edit.
+
+### Launching
+
+```bash
+pip install -e .          # installs pygls
+moray-surgeon lsp         # stdio; logs go to ~/.moray-surgeon/lsp.log (override: MORAY_LSP_LOG)
+```
+
+`lsp` accepts the same provider flags as `refactor`: `--model`, `--base-url` / `--ollama`, `--api-type`, `--api-key` (with `MORAY_API_KEY` fallback). These configure the *AI action* only; the direct AST actions never touch a model.
+
+### VSCode
+
+VSCode has no built-in "attach arbitrary LSP server" switch. Two working paths:
+
+**A. Generic LSP Proxy extension (no code).** Install [*Generic LSP Proxy*](https://marketplace.visualstudio.com/items?itemName=mjmorales.generic-lsp-proxy) and create `.vscode/lsp-proxy.json` in your project:
+
+```json
+[
+  {
+    "languageId": "python",
+    "command": "moray-surgeon",
+    "args": ["lsp"],
+    "fileExtensions": [".py"]
+  }
+]
+```
+
+If `moray-surgeon` is not on VSCode's `PATH`, point `command` at the venv script (`.venv/Scripts/moray-surgeon.exe` on Windows, `.venv/bin/moray-surgeon` elsewhere). Pylance keeps running; VSCode merges code actions from every attached server, so moray-surgeon's entries appear under *Refactor...* next to Pylance's suggestions.
+
+**B. A 20-line companion extension.** The official route is [`vscode-languageclient`](https://code.visualstudio.com/api/language-extensions/language-server-extension-guide): `ServerOptions` = `{ command: "moray-surgeon", args: ["lsp"] }`, `documentSelector` = `[{ language: "python" }]` — and the client handles initialize/didOpen/resolve for you.
+
+### Other editors (built-in clients)
+
+Neovim ≥ 0.8 (`~/.config/nvim/lua/lsp/moray.lua`, then add `require('lsp.moray')`):
+
+```lua
+local configs = require('lspconfig.configs')
+configs.moray_surgeon = {
+  default_config = {
+    cmd = { 'moray-surgeon', 'lsp' },
+    filetypes = { 'python' },
+    root_dir = function(fname)
+      return require('lspconfig.util').find_git_ancestor(fname)
+    end,
+  },
+}
+require('lspconfig').moray_surgeon.setup({})
+```
+
+Helix (`~/.config/helix/languages.toml`):
+
+```toml
+[[language]]
+name = "python"
+language-servers = ["pyright", "moray-surgeon"]
+
+[language-server.moray-surgeon]
+command = "moray-surgeon"
+args = ["lsp"]
+```
+
+## Web dashboard
+
+Prefer pointing and clicking to typing flags? The built-in console serves a single-page, dark-mode UI on `http://127.0.0.1:8080`:
+
+```bash
+moray-surgeon web                 # opens the browser automatically
+moray-surgeon web --port 9000 --no-open
+```
+
+Enter a git repository path and the intent in plain language, press **Execute**, and watch the pipeline live over Server-Sent Events — plan request, AST surgery, ruff/mypy/pytest gates — with the final diff, architecture change and plan JSON rendered in tabs. The engine is the same orchestrator the CLI drives: one run at a time, full rollback on any red gate. `POST /api/refactor` is also a plain JSON API, so the console doubles as a local REST example.
+
+<!-- TODO: drop a demo GIF here (e.g. docs/assets/web-dashboard.gif) -->
+
+## GitHub Issue bot (autopilot pull requests)
+
+`moray-surgeon bot` turns an issue into a verified branch without a local checkout. Triggered by `.github/workflows/moray-bot.yml` on `issues.opened`, it:
+
+1. reads the issue title and body through the GitHub API and uses them as the refactor intent;
+2. clones the repository into a temp directory and resets `moray-bot/issue-<N>` onto the default branch;
+3. runs the same orchestrator as the CLI (plan, AST apply, ruff/mypy/pytest, architecture diff);
+4. pushes the branch and opens a pull request whose body says `Closes #N`.
+
+If any gate fails, nothing is pushed: the bot comments the failing `VerifyResult.feedback()` on the issue and applies the `needs-human` label (add `--close-on-failure` or `MORAY_BOT_CLOSE_ISSUE=1` to close it too).
+
+Copy [docs/github_action_example.yml](docs/github_action_example.yml) to `.github/workflows/moray-bot.yml`. It needs `contents: write`, `issues: write` and `pull-requests: write`, the `MORAY_API_KEY` secret, and the repository setting that lets Actions create pull requests. The workflow runs the repository's own tests with a write token, so it only fires for issues opened by an `OWNER`, `MEMBER` or `COLLABORATOR`; adjust that `if:` deliberately, never remove it.
+
+Configuration is environment-only: `GITHUB_TOKEN` (required), `GITHUB_API_URL` / `GITHUB_SERVER_URL` for GitHub Enterprise, and the usual `MORAY_API_TYPE` / `MORAY_MODEL` / `MORAY_BASE_URL` / `MORAY_API_KEY`. `MORAY_BOT_MAX_ATTEMPTS`, `MORAY_BOT_BASE_BRANCH`, `MORAY_BOT_BRANCH_PREFIX`, `MORAY_BOT_FAILURE_LABEL`, `MORAY_BOT_CLOSE_ISSUE`, `MORAY_BOT_GIT_NAME` and `MORAY_BOT_GIT_EMAIL` tune the bot itself. The token reaches git through `GIT_CONFIG_*` environment variables, never a remote URL or a log line, and GitHub endpoints must be https with a public host.
+
+```bash
+GITHUB_TOKEN=ghp_... moray-surgeon bot --issue 42 --repo acme/widgets
+```
+
+Two operational notes: commits pushed with the built-in `GITHUB_TOKEN` do not trigger other workflows (use a fine-grained PAT if the bot PR must run CI), and the bot branch is pushed with `--force-with-lease`, so a human commit pushed after the clone is never overwritten.
+
 ## Deploy as a Cloud Skill
 
 Platforms like WorkBuddy accept a Serverless code package instead of a long-running service. `scripts/build_skill.py` builds one:
@@ -389,6 +529,34 @@ The model endpoint is configured only through deployment environment variables, 
 | `MORAY_BASE_URL` | `http://localhost:11434` | API root (http/https only; credentials and query strings are rejected) |
 | `MORAY_API_KEY` | unset | Bearer/x-api-key credential for the cloud dialects |
 | `MORAY_TIMEOUT` | `120` | Per-request timeout in seconds |
+
+## Runtime-equivalence gate (differential testing)
+
+pytest proves the suite still passes; it cannot prove uncovered edge cases still behave the same. After a green verification, the orchestrator runs one more gate: every function whose body changed is executed **before and after the refactor, on identical inputs**, and return values, printed output and raised exceptions are compared.
+
+The check runs entirely in-process — no external process is started. Four walls make arbitrary code safe to execute here:
+
+| Wall | Mechanism |
+|---|---|
+| Worker thread | Each sandbox run executes in its own daemon thread; the caller's deadline is honoured even if a worker hangs |
+| Restricted builtins | `exec` receives an allowlist: no `open`, `eval`, `exec`, `getattr`/`setattr`, `globals`; `print` becomes a capturing implementation, so output is comparable data; `__build_class__` keeps normal class definitions working |
+| Import allowlist | Only pure stdlib computation helpers (`math`, `itertools`, `functools`, `collections`, `re`, `json`, ...) import; everything else fails inside the sandbox and turns the run into a documented skip |
+| Trace watchdog | A `sys.settrace` handler counts opcodes of every sandbox frame and enforces a wall-clock deadline; the kill switch derives from `BaseException` so sandbox-level `except Exception` cannot swallow it, and CPython runs trace handlers with tracing disabled so the sandboxed code can neither intercept nor disable it |
+
+A skip is not a verdict. Functions that declare `global`/`nonlocal`, yield, await, import at call time, or reference I/O/randomness names (`os`, `open`, `random`, `time`, ...) are refused statically with a precise reason; a `NameError` raised by **both** versions is also a skip, because inside the sandbox it usually means a needed builtin was withheld — both sides failing identically proves nothing. What remains is a strong, bounded claim: *these two versions returned the same values, printed the same output and raised the same exceptions on the same inputs*.
+
+The public surface is small:
+
+```python
+from moray_surgeon.verify import verify_equivalence, compare_functions, changed_function_names
+
+verify_equivalence(original_source, new_source, "add")            # True / False
+verify_equivalence(original_source, new_source, "add", 2, 3)      # explicit inputs
+compare_functions(...)                                            # tri-state result with details
+changed_function_names(before_source, after_source)               # qualnames whose code changed
+```
+
+Disable it per run with `refactor --no-differential` (or `Orchestrator(differential=False)`); skips and mismatches are visible in the trace (`Differential: skipped 'f' (...)` / `Differential mismatch in 'f'!`).
 
 ## Use as a CI Gateway
 

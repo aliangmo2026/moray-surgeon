@@ -37,6 +37,22 @@ class InstructionError(MorayError):
         self.instruction_index = instruction_index
 
 
+class ConcurrencyError(MorayError):
+    """A worker in a parallel refactor batch failed, so the batch was abandoned.
+
+    The parallel path computes every batch member in a child process and only
+    writes once all of them succeeded, so a failure here means *no* file of the
+    batch was touched. ``instruction_index`` names the step whose worker raised
+    (``None`` when the pool itself broke before any task could be attributed);
+    the original exception is chained as ``__cause__`` so callers can still tell
+    a rejected instruction (``ValueError``) from infrastructure trouble.
+    """
+
+    def __init__(self, message: str, instruction_index: int | None = None) -> None:
+        super().__init__(message)
+        self.instruction_index = instruction_index
+
+
 class DependencyError(MorayError):
     """The plan's step graph cannot be executed as written.
 
@@ -86,9 +102,30 @@ class ScopeViolationError(MorayError):
 
     ``violations`` holds the qualified names of the offending nodes (or the
     affected file paths for created/deleted files), so callers can feed a
-    machine-readable list back to the model or a log.
+    machine-readable list back to the model or the log.
     """
 
     def __init__(self, message: str, violations: tuple[str, ...] = ()) -> None:
         super().__init__(message)
         self.violations = violations
+
+
+class DifferentialError(MorayError):
+    """The differential sandbox could not produce equivalence evidence.
+
+    A skip is not a verdict: impure functions, sandbox-blocked imports, budget
+    exhaustion, methods or missing functions all mean "no evidence". Callers
+    must treat the refactor as untested rather than equivalent -- the
+    orchestrator logs the skip and moves on instead of blocking the commit.
+    """
+
+
+class UnsupportedLanguageError(MorayError):
+    """No :class:`~moray_surgeon.engine.backends.base.LanguageBackend` matches a file.
+
+    The dispatcher resolves a backend from ``target_file``'s suffix *before*
+    reading or writing any byte, so a plan naming a file whose language has no
+    registered backend (today: everything except ``.py``/``.pyi``) fails up
+    front with this error instead of halfway inside a language-specific parser.
+    """
+

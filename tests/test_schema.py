@@ -259,16 +259,6 @@ def test_add_type_hints_function_name_is_optional() -> None:
             },
             "relative",
         ),
-        (
-            {
-                "id": "step1",
-                "action": "rename_symbol",
-                "target_file": "a.txt",
-                "old_name": "a",
-                "new_name": "b",
-            },
-            r"end with \.py",
-        ),
         ({"id": "step1", "action": "noop", "unexpected": 1}, "unexpected"),
         (
             {"id": "step1", "action": "rename_symbol", "target_file": "a.py", "new_name": "b"},
@@ -411,6 +401,21 @@ def test_invalid_payload_raises_validation_error(payload: dict[str, Any], match:
     """Bad actions, paths, ids, extra keys, missing fields and bad ranges must all fail."""
     with pytest.raises(ValidationError, match=match):
         INSTRUCTION_ADAPTER.validate_python(payload)
+
+
+def test_target_file_is_language_neutral() -> None:
+    """The protocol binds no language: suffix gating lives in the backend registry.
+
+    A non-.py target validates here and is rejected later, by the dispatcher,
+    with UnsupportedLanguageError — so adding a backend never touches this
+    module and the model-facing schema stays tool-agnostic.
+    """
+    instruction = INSTRUCTION_ADAPTER.validate_python(
+        {"id": "step1", "action": "rename_symbol", "target_file": "src/app.ts",
+         "old_name": "a", "new_name": "b"}
+    )
+
+    assert instruction.target_file == "src/app.ts"
 
 
 def test_depends_on_parses_and_round_trips() -> None:

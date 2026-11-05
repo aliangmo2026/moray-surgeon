@@ -1,9 +1,19 @@
 """Execute a validated refactor plan against a repository, instruction by instruction.
 
-The dispatcher owns ordering, path containment and error classification. Most
-atoms are source-in / source-out; ``rename_symbol`` and ``move_symbol`` are
-project-aware (Jedi resolves references across files) and rewrite their
-affected files in place, inside the caller's transaction.
+The dispatcher owns ordering, path containment, batching and error classification
+— and, since the LanguageBackend split, *nothing else*: every per-language
+operation lives behind :class:`~moray_surgeon.engine.backends.base.LanguageBackend`,
+which is resolved from each target file's suffix. Adding a language means
+registering a backend; this module never changes again.
+
+Execution has two modes. A *batch* is a run of consecutive, file-disjoint,
+DAG-independent instructions whose atoms depend on nothing but their own target
+file; those are applied in worker processes and written back by this process
+(see :mod:`moray_surgeon.engine.concurrency`). Everything else — project-aware
+atoms (rename/move/inline/dead-code), instructions that share a file, steps
+joined by a ``depends_on`` edge — runs here in plan order, and acts as a barrier
+that flushes the pending batch first. That keeps the observable result identical
+to a strictly sequential run while the CPU-bound parsing happens in parallel.
 
 Invariants:
 
@@ -12,56 +22,53 @@ Invariants:
   authored order. The first failure aborts the run; there is no transactional
   rollback here, so earlier edits stay on disk.
 * Every path is resolved with ``pathlib`` and must stay inside ``repo_root``.
-* Every read and write is UTF-8.
+* The backend is resolved *before* any byte is read, so a target whose language
+  has no registered backend fails with ``UnsupportedLanguageError`` and leaves
+  the file untouched.
+* A parallel batch is validated and only then written, all-or-nothing; a worker
+  failure raises ``ConcurrencyError`` and leaves every file of the batch intact.
+* Every read and write is UTF-8, and every write is atomic (temp file + rename).
 * Nothing is printed: the returned log list is the caller's to render.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from moray_surgeon.engine.base import EditResult
-from moray_surgeon.engine.convert_match import convert_to_match_case
+from moray_surgeon.engine.backends import backend_for
+from moray_surgeon.engine.concurrency import (
+    InstructionTask,
+    atomic_write_text,
+    execute_parallel,
+    is_parallel_safe,
+    resolve_max_workers,
+)
 from moray_surgeon.engine.dag import topological_sort
-from moray_surgeon.engine.extract import extract_function
-from moray_surgeon.engine.extract_variable import extract_variable
-from moray_surgeon.engine.import_manager import add_import, remove_import
 from moray_surgeon.engine.indexer import Indexer, get_indexer
-from moray_surgeon.engine.inline_function import inline_function
-from moray_surgeon.engine.inline_variable import inline_variable
-from moray_surgeon.engine.move_symbol import move_symbol
-from moray_surgeon.engine.remove_dead_code import remove_dead_code
-from moray_surgeon.engine.rename import rename_symbol
-from moray_surgeon.engine.replace_call import replace_call
-from moray_surgeon.engine.split_class import split_class
-from moray_surgeon.engine.type_hints import add_type_hints
 from moray_surgeon.exceptions import (
     InstructionError,
     NoOpEditError,
     PathTraversalError,
+    UnsupportedLanguageError,
 )
 from moray_surgeon.schema.instructions import (
-    AddImport,
-    AddTypeHints,
-    ConvertToMatchCase,
-    ExtractFunction,
-    ExtractVariable,
-    InlineFunction,
-    InlineVariable,
     Instruction,
     MoveSymbol,
     Noop,
     RefactorPlan,
-    RemoveDeadCode,
-    RemoveImport,
-    RenameSymbol,
-    ReplaceCall,
-    SplitClass,
 )
+
+if TYPE_CHECKING:
+    from moray_surgeon.engine.backends.base import LanguageBackend
 
 
 def execute_plan(
-    plan: RefactorPlan, repo_root: Path, indexer: Indexer | None = None
+    plan: RefactorPlan,
+    repo_root: Path,
+    indexer: Indexer | None = None,
+    max_workers: int | None = None,
 ) -> list[str]:
     """Execute every instruction in dependency order; raise on the first failure.
 
@@ -73,6 +80,9 @@ def execute_plan(
         indexer: Optional code-index handle shared by the project-aware atoms.
             Omitting it uses the process-wide handle for ``repo_root``, which the
             orchestrator has already refreshed for this attempt.
+        max_workers: Parallel pool size. ``None`` reads ``MORAY_MAX_WORKERS`` and
+            otherwise uses ``min(cpu_count, 8)``; ``1`` disables the pool. Batches
+            smaller than two instructions always run in this process regardless.
 
     Returns:
         One human-readable log line per applied instruction, in execution order.
@@ -85,50 +95,194 @@ def execute_plan(
         CircularDependencyError: The plan's dependency graph contains a cycle.
         PathTraversalError: ``target_file`` resolves outside ``repo_root``.
         FileNotFoundError: ``target_file`` is missing or not a regular file.
+        UnsupportedLanguageError: No backend registered for a target's suffix.
         InstructionError: An atom rejected the instruction input (e.g. an invalid
             line range); carries the failing ``instruction_index``.
         NoOpEditError: An atom matched nothing (``changes == 0``).
+        ConcurrencyError: A worker process failed while applying a parallel
+            batch; the batch's files were left untouched.
         OSError: Reading or writing the target file failed (permissions, ...).
     """
     root = repo_root.resolve()
     handle = indexer or get_indexer(root)
-    log: list[str] = []
+    workers = resolve_max_workers(max_workers)
+    ordered = topological_sort(plan.instructions)
+    log: dict[int, str] = {}
+    batch = _ParallelBatch(root, handle, workers)
 
-    for index, instruction in enumerate(topological_sort(plan.instructions)):
+    for index, instruction in enumerate(ordered):
         if isinstance(instruction, Noop):
-            log.append(f"[{index}] noop: skipped")
+            batch.flush(log)
+            log[index] = f"[{index}] noop: skipped"
             continue
 
-        if isinstance(instruction, MoveSymbol):
-            log.append(_execute_move_symbol(instruction, index, root, handle))
+        if workers <= 1 or not is_parallel_safe(instruction):
+            batch.flush(log)
+            log[index] = _execute_instruction(instruction, index, root, handle)
             continue
 
-        target = _resolve_target(instruction.target_file, root)
-        source = target.read_text(encoding="utf-8")
+        # Resolve before batching: a path/traversal/language failure must be
+        # reported at this step's position, after the earlier batch has been
+        # written — exactly where a sequential run would stop.
         try:
-            result = _apply(instruction, source, root, target, handle)
-        except ValueError as exc:
-            raise InstructionError(
-                f"{instruction.action} failed for {instruction.target_file}: {exc}",
-                instruction_index=index,
-            ) from exc
+            target = _resolve_target(instruction.target_file, root)
+            backend_for(target)
+        except Exception:
+            batch.flush(log)
+            raise
 
-        if result.changes == 0:
-            raise NoOpEditError(
-                f"instruction {index} ({instruction.action}) changed nothing in "
-                f"{instruction.target_file}"
+        if not batch.can_join(instruction, target):
+            batch.flush(log)
+        batch.add(index, instruction, target, instruction.target_file)
+
+    batch.flush(log)
+    return [log[index] for index in range(len(ordered))]
+
+
+@dataclass(frozen=True)
+class _PendingEdit:
+    """One resolved instruction waiting to be applied by a batch flush.
+
+    ``target_file`` keeps the authored repository-relative path so error and log
+    messages can quote it after the path has been resolved for the worker.
+    """
+
+    index: int
+    instruction: Instruction
+    target: Path
+    target_file: str
+
+
+class _ParallelBatch:
+    """Consecutive instructions that may travel to worker processes together.
+
+    Membership is decided while the dispatcher walks the topologically sorted
+    plan: a single-file action, a target no current member touches, and no
+    ``depends_on`` edge to any current member. Because the walk is consecutive
+    and dependency-respecting, refusing an edge to a member is enough for
+    transitive edges too: any intermediate step is either a member (the edge is
+    refused) or sits between the two instructions, which ends the batch.
+
+    A flush of a one-instruction batch falls back to the sequential path; running
+    a worker for a single file would only add spawn latency.
+    """
+
+    def __init__(self, root: Path, handle: Indexer, workers: int) -> None:
+        self._root = root
+        self._handle = handle
+        self._workers = workers
+        self._edits: list[_PendingEdit] = []
+        self._files: set[Path] = set()
+        self._ids: set[str] = set()
+
+    def can_join(self, instruction: Instruction, target: Path) -> bool:
+        """Report whether ``instruction`` can join without breaking isolation."""
+        if not self._edits:
+            return True
+        return target not in self._files and not self._ids.intersection(
+            instruction.depends_on
+        )
+
+    def add(
+        self, index: int, instruction: Instruction, target: Path, target_file: str
+    ) -> None:
+        """Append an instruction that :meth:`can_join` accepted."""
+        self._edits.append(_PendingEdit(index, instruction, target, target_file))
+        self._files.add(target)
+        self._ids.add(instruction.id)
+
+    def flush(self, log: dict[int, str]) -> None:
+        """Apply and write the pending batch, then reset it.
+
+        Two or more members run in a process pool; the results are validated
+        (no zero-change instruction) before any write, so the batch is
+        all-or-nothing. Writes happen in plan order, after every worker finished.
+        """
+        if not self._edits:
+            return
+        edits = self._edits
+        self._edits = []
+        self._files.clear()
+        self._ids.clear()
+
+        if self._workers <= 1 or len(edits) == 1:
+            for edit in edits:
+                log[edit.index] = _execute_instruction(
+                    edit.instruction, edit.index, self._root, self._handle
+                )
+            return
+
+        tasks = [
+            InstructionTask(edit.index, edit.instruction, self._root, edit.target)
+            for edit in edits
+        ]
+        results = execute_parallel(tasks, self._workers)
+        for edit in edits:
+            if results[edit.index].changes == 0:
+                raise NoOpEditError(
+                    f"instruction {edit.index} ({edit.instruction.action}) changed "
+                    f"nothing in {edit.target_file}"
+                )
+        for edit in edits:
+            atomic_write_text(edit.target, results[edit.index].new_source)
+            log[edit.index] = _log_line(
+                edit.index, edit.instruction, results[edit.index].changes, edit.target
             )
 
-        target.write_text(result.new_source, encoding="utf-8")
-        log.append(f"[{index}] {instruction.action}: {result.changes} change(s) in {target.name}")
 
-    return log
+def _execute_instruction(
+    instruction: Instruction, index: int, root: Path, indexer: Indexer
+) -> str:
+    """Run one instruction in this process and return its log line."""
+    if isinstance(instruction, Noop):  # pragma: no cover - callers filter Noop out
+        raise TypeError("Noop is reported by execute_plan and never applied")
+    if isinstance(instruction, MoveSymbol):
+        return _execute_move_symbol(instruction, index, root, indexer)
+
+    target = _resolve_target(instruction.target_file, root)
+    backend = backend_for(target)
+    return _apply_single_file(instruction, index, target, backend, root, indexer)
+
+
+def _apply_single_file(
+    instruction: Instruction,
+    index: int,
+    target: Path,
+    backend: LanguageBackend,
+    root: Path,
+    indexer: Indexer,
+) -> str:
+    """Apply a single-file atom to ``target``, write it atomically and log it."""
+    if isinstance(instruction, Noop):  # pragma: no cover - callers filter Noop out
+        raise TypeError("Noop is reported by execute_plan and never applied")
+    source = target.read_text(encoding="utf-8")
+    try:
+        result = backend.apply(instruction, source, root, target, indexer)
+    except ValueError as exc:
+        raise InstructionError(
+            f"{instruction.action} failed for {instruction.target_file}: {exc}",
+            instruction_index=index,
+        ) from exc
+
+    if result.changes == 0:
+        raise NoOpEditError(
+            f"instruction {index} ({instruction.action}) changed nothing in "
+            f"{instruction.target_file}"
+        )
+
+    atomic_write_text(target, result.new_source)
+    return _log_line(index, instruction, result.changes, target)
+
+
+def _log_line(index: int, instruction: Instruction, changes: int, target: Path) -> str:
+    """Format the log line shared by the sequential and parallel paths."""
+    return f"[{index}] {instruction.action}: {changes} change(s) in {target.name}"
 
 
 def _execute_move_symbol(
     instruction: MoveSymbol, index: int, root: Path, indexer: Indexer
 ) -> str:
-    """Run the project-aware move atom; it writes every affected file itself.
+    """Run the project-aware move atom through its language backend.
 
     Unlike the single-file atoms, a move touches the source, the target and
     every importer file, so it manages its own writes inside the caller's
@@ -136,8 +290,17 @@ def _execute_move_symbol(
     """
     source_path = _resolve_target(instruction.source_file, root)
     target_path = _resolve_target(instruction.target_file, root)
+    # A move is a same-language operation: both endpoints must resolve to the
+    # same backend. The second lookup also rejects unsupported suffixes before
+    # the backend touches any file.
+    backend = backend_for(source_path)
+    if backend_for(target_path) is not backend:
+        raise UnsupportedLanguageError(
+            f"move_symbol needs one language for both endpoints; "
+            f"{instruction.source_file!r} and {instruction.target_file!r} differ"
+        )
     try:
-        result = move_symbol(
+        result = backend.move_symbol(
             root, source_path, target_path, instruction.symbol_name, indexer
         )
     except ValueError as exc:
@@ -173,73 +336,3 @@ def _resolve_target(target_file: str, repo_root: Path) -> Path:
             f"target_file {target_file!r} does not exist or is not a regular file"
         )
     return target
-
-
-def _apply(
-    instruction: Instruction,
-    source: str,
-    repo_root: Path,
-    target: Path,
-    indexer: Indexer,
-) -> EditResult:
-    """Dispatch one non-noop instruction to its atomic engine operation.
-
-    ``rename_symbol``, ``inline_variable`` and ``remove_dead_code`` are
-    project-aware (Jedi resolves references across files) and need the
-    repository root plus the resolved target path; the remaining atoms consume
-    the source the dispatcher already read. ``MoveSymbol`` never reaches this
-    function: the dispatcher routes it to ``_execute_move_symbol`` because it
-    writes several files itself.
-    """
-    if isinstance(instruction, RenameSymbol):
-        return rename_symbol(
-            repo_root,
-            instruction.target_file,
-            instruction.old_name,
-            instruction.new_name,
-            indexer,
-        )
-    if isinstance(instruction, ExtractFunction):
-        return extract_function(
-            source,
-            instruction.function_name,
-            instruction.start_line,
-            instruction.end_line,
-        )
-    if isinstance(instruction, ConvertToMatchCase):
-        return convert_to_match_case(
-            source,
-            instruction.start_line,
-            instruction.end_line,
-        )
-    if isinstance(instruction, ExtractVariable):
-        return extract_variable(
-            source,
-            instruction.start_line,
-            instruction.start_column,
-            instruction.end_line,
-            instruction.end_column,
-            instruction.variable_name,
-        )
-    if isinstance(instruction, InlineVariable):
-        return inline_variable(source, instruction.variable_name, repo_root, target)
-    if isinstance(instruction, InlineFunction):
-        return inline_function(source, instruction.function_name, repo_root, target)
-    if isinstance(instruction, SplitClass):
-        return split_class(
-            source,
-            instruction.class_name,
-            instruction.methods_to_move,
-            instruction.new_class_name,
-        )
-    if isinstance(instruction, RemoveDeadCode):
-        return remove_dead_code(source, instruction.symbol_name, repo_root, target)
-    if isinstance(instruction, ReplaceCall):
-        return replace_call(source, instruction.old_call, instruction.new_call)
-    if isinstance(instruction, AddTypeHints):
-        return add_type_hints(source, instruction.function_name)
-    if isinstance(instruction, AddImport):
-        return add_import(source, instruction.module, instruction.name, instruction.alias)
-    if isinstance(instruction, RemoveImport):
-        return remove_import(source, instruction.module, instruction.name)
-    raise TypeError(f"unsupported instruction type: {type(instruction).__name__}")

@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>moray-surgeon · surgical console</title>
+<style>
+  :root {
+    --bg: #060608;
+    --panel: #0c0c10;
+    --panel-2: #101015;
+    --border: #1d1d24;
+    --border-hi: #2e2e38;
+    --fg: #ececee;
+    --dim: #87878f;
+    --green: #00dc82;
+    --red: #ff5d5d;
+    --amber: #ffc53d;
+    --blue: #4d9fff;
+    --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: var(--bg); color: var(--fg); font-family: var(--sans); }
+  ::selection { background: rgba(0, 220, 130, .25); }
+  body { min-height: 100vh; }
+
+  /* blueprint grid + top glow */
+  .bg {
+    position: fixed; inset: 0; z-index: -1;
+    background:
+      radial-gradient(ellipse 70% 45% at 50% -8%, rgba(0, 220, 130, .09), transparent 60%),
+      linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+    background-size: 100% 100%, 38px 38px, 38px 38px;
+  }
+
+  main { max-width: 920px; margin: 0 auto; padding: 42px 22px 72px; }
+
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .brand { display: flex; align-items: center; gap: 11px; font-family: var(--mono); font-size: 19px; font-weight: 700; letter-spacing: -.03em; }
+  .mark {
+    width: 28px; height: 28px; border-radius: 8px; display: grid; place-items: center;
+    background: linear-gradient(135deg, #00dc82 10%, #0091ff 90%);
+    color: #03130b; font-size: 15px; font-weight: 800;
+    box-shadow: 0 0 22px rgba(0, 220, 130, .35);
+  }
+  .brand .tld { color: var(--dim); font-weight: 500; }
+  .meta { display: flex; gap: 8px; font-family: var(--mono); font-size: 11px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px; padding: 5px 11px;
+    border: 1px solid var(--border-hi); border-radius: 999px; color: var(--dim); background: var(--panel);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #555; }
+  .dot.ok { background: var(--green); box-shadow: 0 0 8px var(--green); animation: pulse 1.8s infinite; }
+  .dot.bad { background: var(--red); }
+  @keyframes pulse { 50% { opacity: .45; } }
+
+  .tagline { color: var(--dim); font-size: 13.5px; margin: 10px 0 26px; font-family: var(--mono); }
+  .tagline b { color: var(--fg); font-weight: 600; }
+
+  /* pipeline stepper */
+  .pipeline { display: flex; align-items: center; margin-bottom: 26px; }
+  .stage { display: flex; align-items: center; gap: 9px; font-family: var(--mono); font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase; color: #56565f; }
+  .stage .node {
+    width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--border-hi);
+    display: grid; place-items: center; font-size: 11px; color: #4c4c55; background: var(--panel);
+    transition: all .35s ease;
+  }
+  .stage.active { color: var(--fg); }
+  .stage.active .node { border-color: var(--green); color: var(--green); box-shadow: 0 0 0 4px rgba(0,220,130,.13); animation: pulse 1.5s infinite; }
+  .stage.done { color: var(--dim); }
+  .stage.done .node { background: var(--green); border-color: var(--green); color: #04110a; animation: none; }
+  .stage.fail { color: var(--red); }
+  .stage.fail .node { background: var(--red); border-color: var(--red); color: #1a0505; animation: none; }
+  .bar { flex: 1; height: 1px; margin: 0 12px; background: var(--border-hi); position: relative; overflow: hidden; }
+  .bar.flow::after {
+    content: ""; position: absolute; inset: 0;
+    background: linear-gradient(90deg, transparent, var(--green), transparent);
+    animation: sweep 1.2s linear infinite;
+  }
+  @keyframes sweep { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+
+  .panel {
+    border: 1px solid var(--border); border-radius: 14px; background: var(--panel);
+    overflow: hidden; margin-bottom: 18px;
+    box-shadow: 0 18px 50px -30px rgba(0, 0, 0, .9);
+  }
+  .panel-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 11px 16px; border-bottom: 1px solid var(--border); background: var(--panel-2);
+    font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--dim);
+  }
+
+  form .field { padding: 14px 16px 4px; }
+  .field label { display: block; font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); margin-bottom: 7px; }
+  .field input, .field textarea, .field select {
+    width: 100%; background: #09090c; color: var(--fg); border: 1px solid var(--border-hi);
+    border-radius: 9px; padding: 10px 12px; font-size: 13.5px; outline: none;
+    font-family: var(--mono); transition: border-color .2s, box-shadow .2s;
+  }
+  .field textarea { min-height: 84px; resize: vertical; line-height: 1.55; }
+  .field input:focus, .field textarea:focus, .field select:focus {
+    border-color: var(--green); box-shadow: 0 0 0 3px rgba(0, 220, 130, .12);
+  }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr 1.4fr; gap: 10px; }
+  .opts { display: flex; align-items: center; gap: 18px; padding: 12px 16px; flex-wrap: wrap; }
+  .opts label.inline { display: flex; align-items: center; gap: 7px; font-family: var(--mono); font-size: 11.5px; color: var(--dim); cursor: pointer; }
+  .opts input[type="checkbox"] { accent-color: var(--green); width: 14px; height: 14px; }
+
+  .actions { display: flex; align-items: center; gap: 14px; padding: 4px 16px 16px; }
+  #execute {
+    position: relative; display: inline-flex; align-items: center; gap: 9px;
+    background: var(--fg); color: #08080a; border: none; border-radius: 10px;
+    padding: 11px 22px; font-size: 13.5px; font-weight: 650; font-family: var(--sans); cursor: pointer;
+    transition: transform .15s, box-shadow .25s, opacity .2s;
+    box-shadow: 0 0 0 rgba(0, 220, 130, 0);
+  }
+  #execute:hover:not(:disabled) { box-shadow: 0 0 26px rgba(0, 220, 130, .35); transform: translateY(-1px); }
+  #execute:disabled { opacity: .45; cursor: not-allowed; }
+  #execute .sym { font-family: var(--mono); font-weight: 700; }
+  .hint { font-family: var(--mono); font-size: 11px; color: #55555e; }
+  .spinner {
+    width: 13px; height: 13px; border-radius: 50%; display: none;
+    border: 2px solid rgba(8, 8, 10, .25); border-top-color: #08080a; animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .busy .spinner { display: inline-block; }
+
+  .terminal {
+    padding: 16px; min-height: 168px; max-height: 300px; overflow-y: auto;
+    font-family: var(--mono); font-size: 12px; line-height: 1.75; white-space: pre-wrap; word-break: break-all;
+  }
+  .terminal .line { animation: rise .25s ease both; }
+  @keyframes rise { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+  .terminal .t { color: #4a4a53; margin-right: 8px; }
+  .terminal .info  { color: var(--blue); }
+  .terminal .progress { color: var(--dim); }
+  .terminal .success { color: var(--green); }
+  .terminal .error   { color: var(--red); }
+  .cursor { display: inline-block; width: 8px; height: 14px; background: var(--green); vertical-align: -2px; animation: blink 1.05s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip { font-family: var(--mono); font-size: 10.5px; letter-spacing: .06em; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border-hi); color: var(--dim); }
+  .chip.pass { color: var(--green); border-color: rgba(0,220,130,.4); background: rgba(0,220,130,.08); }
+  .chip.fail { color: var(--red); border-color: rgba(255,93,93,.4); background: rgba(255,93,93,.08); }
+  .chip.neutral { color: var(--blue); border-color: rgba(77,159,255,.4); background: rgba(77,159,255,.08); }
+
+  .tabs { display: flex; gap: 2px; padding: 10px 12px 0; border-bottom: 1px solid var(--border); background: var(--panel-2); }
+  .tabs button {
+    background: none; border: none; border-bottom: 2px solid transparent; color: var(--dim);
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase;
+    padding: 8px 14px; cursor: pointer; transition: color .2s, border-color .2s;
+  }
+  .tabs button:hover { color: var(--fg); }
+  .tabs button.on { color: var(--green); border-bottom-color: var(--green); }
+  .code {
+    padding: 16px; min-height: 120px; max-height: 440px; overflow: auto;
+    font-family: var(--mono); font-size: 12px; line-height: 1.65; white-space: pre;
+  }
+  /* display:block, not inline-block: white-space:pre gives inline boxes no
+     wrap opportunity, so consecutive diff lines would share one line box. */
+  .code .add  { color: #3ce38b; background: rgba(0, 220, 130, .08); display: block; }
+  .code .del  { color: #ff8080; background: rgba(255, 93, 93, .08); display: block; }
+  .code .hunk { color: var(--blue); }
+  .code .meta { color: #6a6a74; }
+  .empty { color: #4c4c55; font-style: italic; }
+
+  footer { margin-top: 34px; text-align: center; font-family: var(--mono); font-size: 11px; color: #4c4c55; }
+  footer b { color: var(--dim); font-weight: 600; }
+  a { color: var(--dim); }
+  @media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } .pipeline { flex-wrap: wrap; gap: 8px; } .bar { min-width: 24px; } }
+</style>
+</head>
+<body>
+<div class="bg"></div>
+<main>
+  <header>
+    <div class="brand"><span class="mark">m</span>moray<span class="tld">-surgeon</span></div>
+    <div class="meta">
+      <span class="pill"><span class="dot" id="conn-dot"></span><span id="conn-label">linking</span></span>
+      <span class="pill" id="ver">v—</span>
+    </div>
+  </header>
+  <p class="tagline">Zero-hallucination <b>AST surgery</b> · plan &rarr; apply &rarr; verify, narrated live</p>
+
+  <div class="pipeline">
+    <div class="stage" id="st-plan"><span class="node">1</span>plan</div>
+    <div class="bar" id="bar-1"></div>
+    <div class="stage" id="st-ast"><span class="node">2</span>ast surgery</div>
+    <div class="bar" id="bar-2"></div>
+    <div class="stage" id="st-verify"><span class="node">3</span>verify</div>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head"><span>operating table</span><span id="status">idle</span></div>
+    <form onsubmit="return false">
+      <div class="field">
+        <label for="repo">project path (git repository)</label>
+        <input id="repo" spellcheck="false" placeholder="/absolute/path/to/your/project" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="intent">intent &mdash; natural language</label>
+        <textarea id="intent" spellcheck="false" placeholder="e.g. rename old_name to new_name across the repo, then add type hints"></textarea>
+      </div>
+      <div class="opts">
+        <label class="inline"><input type="checkbox" id="dry"> dry-run (diff only, no commit)</label>
+        <span class="hint" id="attempt-note">max 3 auto-fix rounds</span>
+      </div>
+      <div class="field grid-2">
+        <div>
+          <label for="model">model</label>
+          <input id="model" spellcheck="false" value="qwen2.5-coder:7b" autocomplete="off">
+        </div>
+        <div>
+          <label for="api">api dialect</label>
+          <select id="api">
+            <option value="ollama">ollama (local)</option>
+            <option value="openai">openai-compatible</option>
+            <option value="anthropic">anthropic messages</option>
+          </select>
+        </div>
+        <div>
+          <label for="base">base url</label>
+          <input id="base" spellcheck="false" value="http://localhost:11434" autocomplete="off">
+        </div>
+      </div>
+      <div class="actions">
+        <button id="execute" type="button"><span class="sym">&gt;_</span><span id="execute-label">Execute refactor</span><span class="spinner"></span></button>
+        <span class="hint">ruff &middot; mypy &middot; pytest &middot; differential sandbox &mdash; four gates or it rolls back</span>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head"><span>live console</span><span class="hint" id="sse-note">sse</span></div>
+    <div class="terminal" id="log"><span class="empty">// waiting for an intent&hellip;</span><br><span class="cursor"></span></div>
+  </section>
+
+  <section class="panel" id="report" hidden>
+    <div class="panel-head">
+      <span>surgical report</span>
+      <div class="chips">
+        <span class="chip" id="chip-status">—</span>
+        <span class="chip" id="chip-attempts">—</span>
+        <span class="chip" id="chip-verify">—</span>
+      </div>
+    </div>
+    <nav class="tabs">
+      <button type="button" data-tab="diff" class="on">diff</button>
+      <button type="button" data-tab="arch">architecture</button>
+      <button type="button" data-tab="plan">plan</button>
+      <button type="button" data-tab="verify">verify</button>
+    </nav>
+    <pre class="code" id="tab-diff"></pre>
+    <pre class="code" id="tab-arch" hidden></pre>
+    <pre class="code" id="tab-plan" hidden></pre>
+    <pre class="code" id="tab-verify" hidden></pre>
+  </section>
+
+  <footer>AST surgery by <b>libcst</b> &middot; transactions per attempt &middot; scope-guard + differential gates &middot; <b>moray-surgeon</b></footer>
+</main>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let busy = false;
+
+/* ---------- SSE: live narration ---------- */
+/* Server payloads are JSON-encoded single lines; unwrap them for display. */
+const unwrap = (e) => { try { return JSON.parse(e.data); } catch { return e.data; } };
+const es = new EventSource("/api/stream");
+es.onopen = () => { $("conn-dot").className = "dot ok"; $("conn-label").textContent = "live"; };
+es.onerror = () => { $("conn-dot").className = "dot bad"; $("conn-label").textContent = "reconnecting"; };
+es.addEventListener("progress", (e) => { const t = unwrap(e); log(t, "progress"); stageFromLabel(t); });
+es.addEventListener("info",     (e) => { log(unwrap(e), "info"); });
+es.addEventListener("success",  (e) => { const t = unwrap(e); log(t, "success"); markSuccess(t); });
+es.addEventListener("error",    (e) => { log(unwrap(e), "error"); failStages(); });
+es.addEventListener("result",   (e) => { try { render(JSON.parse(unwrap(e))); } catch (err) {} busyOff(); });
+
+fetch("/api/health").then((r) => r.json()).then((h) => { $("ver").textContent = "v" + h.version; }).catch(() => {});
+
+/* ---------- terminal log ---------- */
+function log(text, cls) {
+  const box = $("log");
+  const empty = box.querySelector(".empty");
+  if (empty) empty.remove();
+  const time = new Date().toTimeString().slice(0, 8);
+  const line = document.createElement("div");
+  line.className = "line";
+  const span = document.createElement("span");
+  span.className = cls;
+  span.textContent = text;
+  line.innerHTML = '<span class="t">' + time + "</span>";
+  line.appendChild(span);
+  box.appendChild(line);
+  box.scrollTop = box.scrollHeight;
+}
+
+/* ---------- pipeline stepper ---------- */
+const STAGES = ["plan", "ast", "verify"];
+function resetStages() {
+  STAGES.forEach((s) => { $("st-" + s).className = "stage"; });
+  $("bar-1").className = "bar"; $("bar-2").className = "bar";
+}
+function activate(name) {
+  const i = STAGES.indexOf(name);
+  STAGES.forEach((s, j) => { if (j < i) $("st-" + s).className = "stage done"; });
+  $("st-" + name).className = "stage active";
+  if (i > 0) $("bar-" + i).className = "bar flow";
+}
+function complete(name, ok) {
+  const i = STAGES.indexOf(name);
+  STAGES.forEach((s, j) => {
+    if (j <= i) $("st-" + s).className = "stage " + (ok ? "done" : "fail");
+  });
+  $("bar-1").className = "bar"; $("bar-2").className = "bar";
+}
+function stageFromLabel(label) {
+  if (label.includes("Requesting plan")) activate("plan");
+  if (label.includes("Applying AST")) activate("ast");
+  if (label.includes("Running verification") || label.includes("Recording AST scope")) activate("verify");
+}
+function markSuccess(label) {
+  if (label.includes("Plan received")) complete("plan", true);
+  if (label.includes("Plan applied")) complete("ast", true);
+  if (label.includes("Verification passed") || label.includes("Dry run complete")) complete("verify", true);
+}
+function failStages() { STAGES.forEach((s) => { if ($("st-" + s).className.includes("active")) $("st-" + s).className = "stage fail"; }); }
+
+/* ---------- execute ---------- */
+$("execute").addEventListener("click", async () => {
+  if (busy) return;
+  const intent = $("intent").value.trim();
+  const repo = $("repo").value.trim();
+  if (!intent || !repo) { log("client: project path and intent are both required.", "error"); return; }
+  busy = true;
+  $("execute").disabled = true;
+  $("execute").classList.add("busy");
+  $("execute-label").textContent = "Operating…";
+  $("status").textContent = "running";
+  $("log").innerHTML = "";
+  resetStages();
+  const payload = {
+    intent: intent,
+    repo_path: repo,
+    model: $("model").value.trim(),
+    base_url: $("base").value.trim(),
+    api_type: $("api").value,
+    dry_run: $("dry").checked,
+  };
+  try {
+    const res = await fetch("/api/refactor", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await res.json();
+    if (!res.ok) { log("server [" + res.status + "]: " + (body.detail || res.statusText), "error"); failStages(); }
+    else render(body);
+  } catch (err) {
+    log("network: " + err, "error");
+    failStages();
+  }
+  busyOff();
+});
+
+function busyOff() {
+  busy = false;
+  $("execute").disabled = false;
+  $("execute").classList.remove("busy");
+  $("execute-label").textContent = "Execute refactor";
+  $("status").textContent = "idle";
+}
+
+/* ---------- report rendering ---------- */
+function esc(text) {
+  const div = document.createElement("div");
+  div.textContent = text === "" ? "\u00a0" : text;
+  return div.innerHTML;
+}
+function renderDiff(el, text) {
+  el.innerHTML = "";
+  if (!text || text === "(no text diff captured)") { el.innerHTML = '<span class="empty">// no diff</span>'; return; }
+  for (const line of text.split("\n")) {
+    const div = document.createElement("div");
+    if (line.startsWith("+++") || line.startsWith("---")) div.className = "meta";
+    else if (line.startsWith("@@")) div.className = "hunk";
+    else if (line.startsWith("+")) div.className = "add";
+    else if (line.startsWith("-")) div.className = "del";
+    div.innerHTML = esc(line);
+    el.appendChild(div);
+  }
+}
+function render(report) {
+  const chip = (id, text, cls) => { const el = $(id); el.textContent = text; el.className = "chip " + (cls || ""); };
+  chip("chip-status", report.success ? "PASS" : "FAILED", report.success ? "pass" : "fail");
+  chip("chip-attempts", report.attempts + " attempt(s)", "neutral");
+  chip("chip-verify", report.verify_stage ? "verify: " + report.verify_stage + (report.verify_ok ? " ✓" : " ✗") : "verify: —",
+       report.verify_ok === true ? "pass" : report.verify_ok === false ? "fail" : "");
+  renderDiff($("tab-diff"), report.diff);
+  $("tab-arch").innerHTML = report.architecture_diff ? esc(report.architecture_diff) : '<span class="empty">// architecture unchanged or scribe unavailable</span>';
+  $("tab-plan").innerHTML = report.plan ? esc(JSON.stringify(report.plan, null, 2)) : '<span class="empty">// no plan</span>';
+  $("tab-verify").innerHTML = report.verify_feedback ? esc(report.verify_feedback) : '<span class="empty">// no verification output</span>';
+  $("report").hidden = false;
+  if (report.success) complete("verify", true); else failStages();
+}
+
+/* ---------- tabs ---------- */
+document.querySelectorAll(".tabs button").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".tabs button").forEach((b) => b.classList.remove("on"));
+    btn.classList.add("on");
+    ["diff", "arch", "plan", "verify"].forEach((tab) => { $("tab-" + tab).hidden = tab !== btn.dataset.tab; });
+  });
+});
+</script>
+</body>
+</html>

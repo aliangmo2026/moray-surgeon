@@ -8,9 +8,18 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
+from moray_surgeon.exceptions import ConcurrencyError
 from moray_surgeon.intent import IntentParserError
 from moray_surgeon.orchestrator import Orchestrator, _failing_test_files
-from moray_surgeon.schema import Noop, RefactorPlan, RenameSymbol, ReplaceCall, SplitClass
+from moray_surgeon.schema import (
+    AddTypeHints,
+    ExtractFunction,
+    Noop,
+    RefactorPlan,
+    RenameSymbol,
+    ReplaceCall,
+    SplitClass,
+)
 from moray_surgeon.ui import LiveTrace
 from moray_surgeon.verify import Verifier, VerifyResult
 
@@ -299,6 +308,39 @@ def test_engine_error_propagates_without_retry(tmp_path):
     assert verifier.calls == 0
     assert _read(repo / "app.py") == _ORIGINAL
     assert _commit_count(repo) == 1
+
+
+def test_concurrency_error_rolls_back_the_whole_batch(tmp_path, monkeypatch):
+    """A failing worker surfaces as ConcurrencyError and triggers the rollback.
+
+    The two instructions target different files and share no dependency, so the
+    dispatcher runs them in one process-pool batch. The second one is rejected by
+    its atom, which must cancel the batch and leave the *first* file untouched.
+    """
+    monkeypatch.setenv("MORAY_MAX_WORKERS", "2")
+    repo = _init_repo(tmp_path)
+    other = _write(repo / "other.py", "def other():\n    return 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "other")
+    plan = RefactorPlan(
+        instructions=[
+            AddTypeHints(id="s1", target_file="app.py", function_name=None),
+            ExtractFunction(
+                id="s2", target_file="other.py", function_name="h", start_line=90, end_line=99
+            ),
+        ]
+    )
+    verifier = FakeVerifier([_ok()])
+
+    with pytest.raises(ConcurrencyError) as excinfo:
+        Orchestrator(FakeParser([plan]), verifier).run("annotate and extract", repo)
+
+    assert excinfo.value.instruction_index == 1
+    assert verifier.calls == 0
+    assert _read(repo / "app.py") == _ORIGINAL
+    assert _read(other) == "def other():\n    return 1\n"
+    assert _git(repo, "status", "--porcelain").stdout == ""
+    assert _commit_count(repo) == 2
 
 
 def test_intent_parser_error_propagates_without_retry(tmp_path):
@@ -615,7 +657,12 @@ def test_scope_guard_can_be_disabled_explicitly(tmp_path, monkeypatch):
         "moray_surgeon.orchestrator.execute_plan", _collateral_edit_dispatcher()
     )
 
-    report = Orchestrator(parser, verifier, scope_guard=False).run("rename old_name", repo)
+    # differential=False isolates the variable under test: the collateral
+    # edit is a behavioural change, and the differential gate (on by default)
+    # would otherwise catch it before the disabled scope guard ever could.
+    report = Orchestrator(parser, verifier, scope_guard=False, differential=False).run(
+        "rename old_name", repo
+    )
 
     assert report.success is True
     assert report.attempts == 1

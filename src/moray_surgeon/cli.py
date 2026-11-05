@@ -77,6 +77,14 @@ def refactor(
         "--clear-cache",
         help="Delete the local code index before running (it is rebuilt on demand).",
     ),
+    no_differential: bool = typer.Option(
+        False,
+        "--no-differential",
+        help=(
+            "Skip the runtime-equivalence gate: do not execute changed functions "
+            "before and after the refactor in the differential sandbox."
+        ),
+    ),
 ) -> None:
     """Plan, apply, verify and auto-fix one refactoring intent."""
     if not (path / ".git").exists():
@@ -112,6 +120,7 @@ def refactor(
             ),
             max_attempts=max_attempts,
             trace=LiveTrace(attempt=1, max_attempts=max_attempts, intent=intent),
+            differential=not no_differential,
         )
         report = orchestrator.run(intent, path, context, target_files, dry_run)
     except (MorayError, OSError) as exc:
@@ -187,12 +196,96 @@ def audit(
 
 
 @app.command()
+def bot(
+    issue: int = typer.Option(..., "--issue", help="GitHub issue number to resolve."),
+    repo: str = typer.Option(..., "--repo", help="Target repository as owner/name."),
+    work_dir: Path | None = typer.Option(
+        None, "--work-dir", help="Keep the clone under this directory (default: temp dir)."
+    ),
+    close_on_failure: bool = typer.Option(
+        False,
+        "--close-on-failure",
+        help=(
+            "Also close the issue when the refactor fails "
+            "(the needs-human label is always added)."
+        ),
+    ),
+) -> None:
+    """Refactor a GitHub issue and open a verified pull request.
+
+    Credentials and endpoints come from the environment: GITHUB_TOKEN is
+    required; GITHUB_API_URL/GITHUB_SERVER_URL cover GitHub Enterprise; the
+    MORAY_* variables configure the model. See docs/github_action_example.yml.
+    """
+    # Imported lazily so the other CLI commands do not load PyGithub.
+    from moray_surgeon.bot import BotConfig, run_github_bot
+
+    try:
+        config = BotConfig.from_env(close_on_failure=close_on_failure or None)
+        result = run_github_bot(issue, repo, config=config, work_dir=work_dir)
+    except (MorayError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if result.success:
+        typer.echo(f"pull request: {result.pull_request_url}")
+        raise typer.Exit(code=0)
+    typer.echo(f"bot stopped: {result.message}", err=True)
+    raise typer.Exit(code=1)
+
+
+@app.command()
 def mcp() -> None:
     """Start the moray-surgeon MCP server over stdio."""
     # Imported lazily so ordinary CLI commands do not load the MCP SDK.
     from moray_surgeon.mcp_server import main as run_mcp_server
 
     run_mcp_server()
+
+
+@app.command()
+def lsp(
+    model: str = typer.Option(
+        "qwen2.5-coder:7b",
+        "--model",
+        help="Ollama model tag, or model name for a cloud API (AI code action).",
+    ),
+    base_url: str = typer.Option(
+        "http://localhost:11434",
+        "--base-url",
+        "--ollama",
+        help="Ollama base URL, or cloud API root (OpenAI-compatible .../v1 or Anthropic Messages).",
+    ),
+    api_type: str = typer.Option(
+        "ollama",
+        "--api-type",
+        help=(
+            "Transport dialect for the AI code action: 'ollama' (local), "
+            "'openai' (/chat/completions), or 'anthropic' (Messages API)."
+        ),
+    ),
+    api_key: str | None = typer.Option(
+        None,
+        "--api-key",
+        help=(
+            "API key for --api-type openai or anthropic. Prefer the "
+            "MORAY_API_KEY environment variable."
+        ),
+    ),
+) -> None:
+    """Start the moray-surgeon language server over stdio (editors launch this)."""
+    # Imported lazily so ordinary CLI commands do not load pygls.
+    from moray_surgeon.lsp_server import LspServerConfig
+    from moray_surgeon.lsp_server import main as run_lsp_server
+
+    # The environment is the preferred credential channel: a flag is visible in
+    # shell history and process listings.
+    resolved_api_key = api_key or os.environ.get("MORAY_API_KEY") or None
+    run_lsp_server(
+        LspServerConfig(
+            model=model, base_url=base_url, api_type=api_type, api_key=resolved_api_key
+        )
+    )
 
 
 @app.command()
@@ -226,6 +319,21 @@ def cache(
     typer.echo(f"files: {summary.files}")
     typer.echo(f"symbols: {summary.symbols}")
     typer.echo(f"size: {summary.size_bytes} bytes")
+
+
+@app.command()
+def web(
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address of the dashboard."),
+    port: int = typer.Option(8080, "--port", help="Port of the dashboard."),
+    no_open: bool = typer.Option(
+        False, "--no-open", help="Do not open the system browser automatically."
+    ),
+) -> None:
+    """Start the web dashboard (http://127.0.0.1:8080) and open it in a browser."""
+    # Imported lazily so ordinary CLI commands do not load FastAPI/uvicorn.
+    from moray_surgeon.web_server import run_server
+
+    run_server(host=host, port=port, open_browser=not no_open)
 
 
 def _load_plan(plan_path: Path | None) -> RefactorPlan | None:
