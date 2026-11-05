@@ -818,3 +818,263 @@ def test_bot_command_requires_a_github_token(monkeypatch):
 
     assert result.exit_code == 1
     assert "GITHUB_TOKEN is required" in _output(result)
+
+
+# --------------------------------------------------------------------------- #
+# time-travel / install-hook
+# --------------------------------------------------------------------------- #
+
+
+def _time_travel_result():
+    from moray_surgeon.time_travel import TimeTravelResult
+
+    return TimeTravelResult(
+        branch="main",
+        new_branch="moray-time-travel/main",
+        base_commit="a" * 40,
+        original_tip="b" * 40,
+        refactor_commit="c" * 40,
+        rewritten_tip="d" * 40,
+        requested_steps=2,
+        replayed_commits=2,
+    )
+
+
+def test_time_travel_help_lists_the_controls():
+    result = runner.invoke(app, ["time-travel", "--help"])
+
+    assert result.exit_code == 0
+    for flag in ("--intent", "--branch", "--steps", "--push", "--pr", "--skip-verify"):
+        assert flag in result.output
+
+
+def test_time_travel_command_reports_the_new_branch(tmp_path, monkeypatch):
+    from moray_surgeon import time_travel as time_travel_module
+
+    calls: dict[str, object] = {}
+
+    def fake_run(repo_root, branch, steps, intent, *, orchestrator_factory, force=False):
+        calls.update(
+            {
+                "repo_root": repo_root,
+                "branch": branch,
+                "steps": steps,
+                "intent": intent,
+                "force": force,
+            }
+        )
+        return _time_travel_result()
+
+    monkeypatch.setattr(time_travel_module, "run_time_travel", fake_run)
+
+    result = runner.invoke(
+        app,
+        [
+            "time-travel",
+            "--intent",
+            "annotate",
+            "--path",
+            str(tmp_path),
+            "--branch",
+            "main",
+            "--steps",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0, _output(result)
+    assert calls["branch"] == "main"
+    assert calls["steps"] == 2
+    assert calls["force"] is False
+    output = _output(result)
+    assert "new branch: moray-time-travel/main" in output
+    assert "replayed 2 of 2 commit(s)" in output
+    assert "push with: git push origin moray-time-travel/main" in output
+
+
+def test_time_travel_pr_requires_a_token(tmp_path, monkeypatch):
+    from moray_surgeon import time_travel as time_travel_module
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    called: list[object] = []
+    monkeypatch.setattr(
+        time_travel_module, "run_time_travel", lambda *args, **kwargs: called.append(1)
+    )
+
+    result = runner.invoke(
+        app, ["time-travel", "--intent", "annotate", "--path", str(tmp_path), "--pr"]
+    )
+
+    assert result.exit_code == 1
+    assert "GITHUB_TOKEN" in _output(result)
+    assert called == []
+
+
+def test_time_travel_pr_pushes_and_prints_the_pull_request(tmp_path, monkeypatch):
+    from moray_surgeon import time_travel as time_travel_module
+
+    monkeypatch.setenv("GITHUB_TOKEN", "tok")
+    monkeypatch.setattr(
+        time_travel_module, "run_time_travel", lambda *args, **kwargs: _time_travel_result()
+    )
+    pushed: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        time_travel_module,
+        "push_rewritten_branch",
+        lambda root, remote, branch: pushed.append((remote, branch)),
+    )
+    opened: dict[str, object] = {}
+
+    def fake_open(root, **kwargs: object):
+        opened.update(kwargs)
+        return "https://github.com/acme/widgets/pull/9"
+
+    monkeypatch.setattr(time_travel_module, "open_time_travel_pull_request", fake_open)
+
+    result = runner.invoke(
+        app,
+        [
+            "time-travel",
+            "--intent",
+            "annotate",
+            "--path",
+            str(tmp_path),
+            "--pr",
+            "--remote",
+            "upstream",
+        ],
+    )
+
+    assert result.exit_code == 0, _output(result)
+    assert pushed == [("upstream", "moray-time-travel/main")]
+    assert opened["token"] == "tok"
+    assert opened["base_branch"] == "main"
+    assert opened["head_branch"] == "moray-time-travel/main"
+    assert "pull request: https://github.com/acme/widgets/pull/9" in _output(result)
+
+
+def test_install_hook_command_writes_the_pre_commit_hook(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "--initial-branch=main"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=True,
+    )
+
+    result = runner.invoke(app, ["install-hook", "--path", str(repo)])
+
+    assert result.exit_code == 0, _output(result)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    assert hook.is_file()
+    assert "moray_surgeon audit" in hook.read_text(encoding="utf-8")
+    assert "installed" in _output(result)
+    assert "--no-verify" in _output(result)
+
+
+# --------------------------------------------------------------------------- #
+# export-sft
+# --------------------------------------------------------------------------- #
+
+
+def test_export_sft_help_lists_the_controls():
+    result = runner.invoke(app, ["export-sft", "--help"])
+
+    assert result.exit_code == 0
+    for flag in ("--path", "--branch", "--steps", "--output", "--format", "--no-repo-map"):
+        assert flag in result.output
+
+
+def test_export_sft_command_reports_the_dataset(tmp_path, monkeypatch):
+    from moray_surgeon.data import flywheel
+
+    report = flywheel.ExportReport(
+        commits_scanned=5,
+        files_analyzed=3,
+        samples=2,
+        actions=(("add_import", 1), ("rename_symbol", 1)),
+        output=tmp_path / "sft.jsonl",
+        fmt="openai",
+    )
+    monkeypatch.setattr(flywheel, "export_sft", lambda *args, **kwargs: report)
+
+    result = runner.invoke(
+        app, ["export-sft", "--path", str(tmp_path), "--steps", "5"]
+    )
+
+    assert result.exit_code == 0, _output(result)
+    output = _output(result)
+    assert "commits scanned: 5" in output
+    assert "files analyzed: 3" in output
+    assert "samples: 2" in output
+    assert "rename_symbol=1" in output
+    assert f"wrote: {report.output}" in output
+
+
+def test_export_sft_rejects_an_unknown_format(tmp_path):
+    result = runner.invoke(
+        app, ["export-sft", "--path", str(tmp_path), "--format", "csv"]
+    )
+
+    assert result.exit_code == 1
+    assert "unsupported format" in _output(result)
+
+
+def test_export_sft_command_writes_an_empty_dataset_for_a_root_only_repo(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Moray Test",
+        "GIT_AUTHOR_EMAIL": "moray@example.com",
+        "GIT_COMMITTER_NAME": "Moray Test",
+        "GIT_COMMITTER_EMAIL": "moray@example.com",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "commit.gpgsign",
+        "GIT_CONFIG_VALUE_0": "false",
+        "GIT_CONFIG_KEY_1": "core.autocrlf",
+        "GIT_CONFIG_VALUE_1": "false",
+    }
+    (repo / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    for command in (
+        ["git", "init", "-q", "--initial-branch=main"],
+        ["git", "add", "-A"],
+        ["git", "commit", "-q", "-m", "base"],
+    ):
+        subprocess.run(
+            command,
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=True,
+            env=env,
+        )
+    output = tmp_path / "sft.jsonl"
+
+    result = runner.invoke(
+        app,
+        [
+            "export-sft",
+            "--path",
+            str(repo),
+            "--steps",
+            "5",
+            "--output",
+            str(output),
+        ],
+    )
+
+    assert result.exit_code == 0, _output(result)
+    assert "samples: 0" in _output(result)
+    assert output.is_file()
+    assert output.read_text(encoding="utf-8") == ""

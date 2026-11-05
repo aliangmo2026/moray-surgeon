@@ -121,6 +121,15 @@ class IntentParser:
             schema=self._schema_json, chinese_rule=_CHINESE_ONLY_JSON_RULE
         )
 
+    @property
+    def system_prompt(self) -> str:
+        """Return the exact system message this parser sends to the model.
+
+        Dataset exporters reuse it so a fine-tuned model sees the same contract
+        at training and inference time.
+        """
+        return self._system_prompt
+
     def parse(self, intent: str, repo_root: Path, extra_context: str = "") -> RefactorPlan:
         """Compile ``intent`` into a plan, retrying once on invalid model output.
 

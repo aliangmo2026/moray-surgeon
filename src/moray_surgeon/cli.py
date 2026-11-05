@@ -195,6 +195,232 @@ def audit(
     raise typer.Exit(code=1)
 
 
+@app.command("time-travel")
+def time_travel(
+    intent: str = typer.Option(
+        ..., "--intent", help="Refactoring request applied to the base commit."
+    ),
+    path: Path = typer.Option(Path("."), "--path", help="Repository root."),
+    branch: str | None = typer.Option(
+        None, "--branch", help="Branch whose last N commits are rewritten (default: current)."
+    ),
+    steps: int = typer.Option(
+        1, "--steps", min=1, help="Number of most recent commits to rewrite."
+    ),
+    model: str = typer.Option("qwen2.5-coder:7b", "--model", help="Model name."),
+    base_url: str = typer.Option(
+        "http://localhost:11434",
+        "--base-url",
+        "--ollama",
+        help="Ollama base URL or cloud API root.",
+    ),
+    api_type: str = typer.Option(
+        "ollama", "--api-type", help="'ollama', 'openai' or 'anthropic'."
+    ),
+    api_key: str | None = typer.Option(
+        None, "--api-key", help="Model credential; prefer MORAY_API_KEY."
+    ),
+    max_attempts: int = typer.Option(3, "--max-attempts", help="Plan/verify rounds."),
+    mypy_target: str = typer.Option(
+        "src", "--mypy-target", help="Path passed to mypy inside the temporary worktree."
+    ),
+    pytest_args: str = typer.Option(
+        "-q", "--pytest-args", help="Space-separated pytest arguments."
+    ),
+    no_differential: bool = typer.Option(
+        False, "--no-differential", help="Skip the runtime-equivalence gate."
+    ),
+    skip_verify: bool = typer.Option(
+        False,
+        "--skip-verify",
+        help=(
+            "DANGEROUS: accept the refactor without ruff/mypy/pytest. The AST "
+            "scope gate still runs. Prefer fixing the historical checkout."
+        ),
+    ),
+    push: bool = typer.Option(False, "--push", help="Push the rewritten branch."),
+    pr: bool = typer.Option(
+        False, "--pr", help="Push and open a review pull request (needs GITHUB_TOKEN)."
+    ),
+    remote: str = typer.Option("origin", "--remote", help="Remote used by --push/--pr."),
+    force: bool = typer.Option(
+        False, "--force", help="Replace an existing moray-time-travel/<branch> branch."
+    ),
+) -> None:
+    """Apply one refactor across the last N commits on a new branch.
+
+    The original branch and working tree are never modified. The rewrite happens
+    in a temporary worktree; a conflict aborts and removes it. A rewritten
+    history cannot be merged normally, so --pr opens a review PR whose body
+    carries the force-push command a maintainer runs after approval.
+    """
+    from moray_surgeon.time_travel import (
+        SkipVerifier,
+        open_time_travel_pull_request,
+        push_rewritten_branch,
+        run_time_travel,
+    )
+
+    resolved_api_key = api_key or os.environ.get("MORAY_API_KEY") or None
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if pr and not token:
+        typer.echo("error: GITHUB_TOKEN is required for --pr", err=True)
+        raise typer.Exit(code=1)
+    if skip_verify:
+        typer.echo(
+            "warning: --skip-verify disables ruff/mypy/pytest for the rewritten "
+            "history; the AST scope gate still applies.",
+            err=True,
+        )
+
+    def build(worktree: Path) -> Orchestrator:
+        parser = IntentParser(
+            model=model,
+            base_url=base_url,
+            api_key=resolved_api_key,
+            api_type=api_type,
+        )
+        verifier: Verifier = (
+            SkipVerifier()
+            if skip_verify
+            else Verifier(
+                worktree,
+                mypy_target=mypy_target,
+                pytest_args=shlex.split(pytest_args),
+            )
+        )
+        return Orchestrator(
+            parser,
+            verifier,
+            max_attempts=max_attempts,
+            differential=not no_differential,
+        )
+
+    try:
+        result = run_time_travel(
+            path, branch, steps, intent, orchestrator_factory=build, force=force
+        )
+    except (MorayError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"new branch: {result.new_branch}")
+    typer.echo(
+        f"replayed {result.replayed_commits} of {result.requested_steps} commit(s); "
+        f"{result.base_commit[:12]} -> {result.rewritten_tip[:12]}"
+    )
+    typer.echo(f"inspect: git log --oneline {result.branch}..{result.new_branch}")
+
+    if push or pr:
+        try:
+            push_rewritten_branch(path, remote, result.new_branch)
+        except (MorayError, OSError) as exc:
+            typer.echo(
+                f"error: {exc}\nthe rewritten branch is still local: {result.new_branch}",
+                err=True,
+            )
+            raise typer.Exit(code=1) from exc
+        typer.echo(f"pushed {result.new_branch} to {remote}")
+
+    if pr:
+        try:
+            url = open_time_travel_pull_request(
+                path,
+                remote=remote,
+                base_branch=result.branch,
+                head_branch=result.new_branch,
+                intent=intent,
+                result=result,
+                token=token,
+            )
+        except (MorayError, OSError) as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+        typer.echo(f"pull request: {url}")
+    elif not push:
+        typer.echo(f"push with: git push {remote} {result.new_branch}")
+    raise typer.Exit(code=0)
+
+
+@app.command("install-hook")
+def install_hook(
+    path: Path = typer.Option(Path("."), "--path", help="Repository root."),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Replace a pre-commit hook that was not installed by moray-surgeon.",
+    ),
+) -> None:
+    """Install a pre-commit hook that blocks commits failing `moray-surgeon audit`."""
+    from moray_surgeon.hooks import install_pre_commit_hook
+
+    try:
+        hook = install_pre_commit_hook(path, force=force)
+    except (MorayError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"installed {hook}")
+    typer.echo(
+        "The hook runs `moray-surgeon audit` before every commit; "
+        "bypass one commit with `git commit --no-verify`."
+    )
+    raise typer.Exit(code=0)
+
+
+@app.command("export-sft")
+def export_sft(
+    path: Path = typer.Option(Path("."), "--path", help="Repository root."),
+    branch: str = typer.Option("HEAD", "--branch", help="Revision to walk."),
+    steps: int = typer.Option(
+        50, "--steps", min=1, help="Number of most recent commits to mine."
+    ),
+    output: Path = typer.Option(
+        Path("moray-sft.jsonl"), "--output", help="Destination JSONL file."
+    ),
+    fmt: str = typer.Option(
+        "openai",
+        "--format",
+        help="'openai' (messages) or 'alpaca' (instruction/input/output).",
+    ),
+    no_repo_map: bool = typer.Option(
+        False, "--no-repo-map", help="Omit the parent-commit code map (faster)."
+    ),
+) -> None:
+    """Export real commit refactors as a fine-tuning JSONL dataset."""
+    from moray_surgeon.data.flywheel import export_sft as run_export
+
+    try:
+        report = run_export(
+            path,
+            branch=branch,
+            steps=steps,
+            output=output,
+            fmt=fmt,
+            include_repo_map=not no_repo_map,
+        )
+    except (MorayError, OSError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(f"commits scanned: {report.commits_scanned}")
+    typer.echo(f"files analyzed: {report.files_analyzed}")
+    typer.echo(f"samples: {report.samples}")
+    if report.actions:
+        typer.echo(
+            "actions: "
+            + ", ".join(f"{name}={count}" for name, count in report.actions)
+        )
+    else:
+        typer.echo("actions: none")
+    typer.echo(f"wrote: {report.output} ({report.fmt})")
+    if report.samples == 0:
+        typer.echo(
+            "warning: no trainable AST changes were found in the selected range",
+            err=True,
+        )
+    raise typer.Exit(code=0)
+
+
 @app.command()
 def bot(
     issue: int = typer.Option(..., "--issue", help="GitHub issue number to resolve."),

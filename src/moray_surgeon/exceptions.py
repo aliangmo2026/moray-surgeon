@@ -150,3 +150,31 @@ class TypeScriptBridgeError(MorayError):
     so the dispatcher classifies them exactly like a Python atom rejection.
     """
 
+
+class TimeTravelError(MorayError):
+    """A historical rewrite could not be completed safely.
+
+    The rewrite happens in a temporary linked worktree on a new branch. Every
+    failure path — a failed refactor, a rebase conflict, a merge commit in the
+    window — aborts and removes that worktree and the new branch. The original
+    branch, its commits and the user's working tree are never modified.
+    """
+
+
+class HookError(MorayError):
+    """The pre-commit guard could not be installed.
+
+    Raised for a path that is not a Git repository, an existing hook that was not
+    installed by moray-surgeon (unless ``--force`` is used), or a filesystem
+    failure while writing ``hooks/pre-commit``.
+    """
+
+
+class FlywheelError(MorayError):
+    """A fine-tuning dataset could not be extracted from the repository.
+
+    Covers an unusable repository/rev, an unsupported output format, and git or
+    archive failures. Individual commits and files that cannot be analysed are
+    skipped; only a failure that prevents the export itself is raised.
+    """
+

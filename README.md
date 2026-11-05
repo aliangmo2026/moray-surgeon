@@ -702,6 +702,67 @@ A ready-to-use workflow lives at [`.github/workflows/moray-audit.yml`](./.github
 
 To enforce an authorising plan in CI, add `--plan moray-plan.json` and commit that file with the pull request.
 
+## Rewriting history and guarding commits
+
+### Time travel
+
+```bash
+moray-surgeon time-travel --branch main --steps 5 \
+  --intent "rename old_name to new_name across the repo" \
+  [--push] [--pr] [--force] [--skip-verify] [--no-differential]
+```
+
+The original branch and working tree are **never modified**. The command creates a temporary linked worktree at `main~5`, runs one orchestrator pass there (plan → AST surgery → verification → commit), then replays the five original commits onto the refactor with a non-interactive `git rebase --onto`. The result lives on `moray-time-travel/main` in the same repository.
+
+- A merge commit in the selected window is refused (flattening merges is a different, riskier operation).
+- Any replay conflict aborts the rebase, deletes the new branch and removes the worktree; `main` is untouched.
+- Historical checkouts often fail today's gates for reasons unrelated to the intent. `--skip-verify` accepts the plan without ruff/mypy/pytest and prints a warning; the AST scope gate still runs. `--no-differential` skips the runtime-equivalence sandbox.
+- Repository hooks are isolated for the temporary commit, so an installed pre-commit guard cannot block a commit the orchestrator already verified. The index cache is ignored for the same reason, keeping the transaction's stash round-trip clean.
+
+A rewritten history cannot be merged normally — merging would join both histories instead of replacing one. `--push` publishes the branch; `--pr` also opens a review PR whose body carries the force-push a maintainer runs after approval:
+
+```bash
+git push --force-with-lease origin moray-time-travel/main:main
+```
+
+### Commit guard
+
+```bash
+moray-surgeon install-hook            # adds .git/hooks/pre-commit
+moray-surgeon install-hook --force    # replace a hook not installed by moray-surgeon
+```
+
+The hook runs `moray-surgeon audit` before every commit (first commit included, compared against Git's empty tree) and blocks the commit on a non-zero audit. It honours `core.hooksPath`, prefers the `moray-surgeon` console script and falls back to the interpreter that installed it, because GUI Git clients often have a minimal `PATH`. `git commit --no-verify` bypasses it for one commit. The audit is conservative: it verifies the whole working tree, so an untracked syntax error can block a commit until it is fixed or stashed; it also runs the project's full gates, so a repository without a passing pytest suite will fail the pytest gate.
+
+## Fine-tuning data flywheel
+
+The engine's contract is *intent in, ``RefactorPlan`` JSON out*; real history can teach exactly that pair.
+
+```bash
+moray-surgeon export-sft --path . --steps 200 --output moray-sft.jsonl
+moray-surgeon export-sft --path . --steps 200 --format alpaca --no-repo-map
+```
+
+For each of the most recent N commits it reads the parent and the commit with git plumbing, parses both with libcst and recognises the changes the engine can actually express:
+
+| Detected change | Emitted instruction |
+|---|---|
+| A top-level function/class/variable renamed, signature and body unchanged | `rename_symbol` |
+| A callee replaced while every argument list stayed identical | `replace_call` |
+| Module-level imports added or removed | `add_import` / `remove_import` |
+| A function that gained exactly a `-> None` return annotation | `add_type_hints` |
+
+Anything ambiguous is skipped on purpose: a rename combined with a body edit, a replacement whose arguments also changed, relative imports the schema cannot encode, merge commits and root commits. Silence beats wrong supervision.
+
+Each sample contains the **parent-commit Repository Code Map** (built from `git archive` of that commit) and the **full pre-change file**, plus the commit subject. The assistant target is the canonical `RefactorPlan` JSON, validated by the same Pydantic models the runtime uses.
+
+Two JSONL layouts:
+
+- `openai` (default): `{"messages": [system, user, assistant]}`, the strict OpenAI/TRL chat format. The system message is the exact prompt `IntentParser` sends at inference time, including the JSON Schema.
+- `alpaca`: `{"instruction", "input", "output"}` for classic instruction tuning; `--no-repo-map` keeps it compact.
+
+The full OpenAI form is roughly 40 KB per sample on a small repository (the inlined schema dominates); that fits the 16k–32k context windows of current 7B/70B code models. Use the Alpaca form when you want a few-thousand-token budget instead.
+
 ## Engineering standards
 
 | Gate | Result |
