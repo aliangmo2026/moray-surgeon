@@ -198,16 +198,16 @@ def test_apply_task_rewrites_source_without_writeback(tmp_path):
 
 
 def test_apply_task_rejects_an_unregistered_language(tmp_path):
-    target = tmp_path / "a.ts"
-    target.write_text("const x = 1;\n", encoding="utf-8")
+    target = tmp_path / "a.rs"
+    target.write_text("fn main() {}\n", encoding="utf-8")
 
-    with pytest.raises(UnsupportedLanguageError, match=r"'\.ts'"):
+    with pytest.raises(UnsupportedLanguageError, match=r"'\.rs'"):
         apply_task(
             _task(
                 0,
                 tmp_path,
-                "a.ts",
-                ReplaceCall(id="s", target_file="a.ts", old_call="a()", new_call="b()"),
+                "a.rs",
+                ReplaceCall(id="s", target_file="a.rs", old_call="a()", new_call="b()"),
             )
         )
 

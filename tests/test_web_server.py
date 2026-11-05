@@ -119,6 +119,49 @@ def test_health_reports_version():
     assert body["version"] == web_server.__version__
 
 
+def test_config_reports_environment_defaults(monkeypatch):
+    monkeypatch.setenv("MORAY_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("MORAY_BASE_URL", "https://api.example.com/v1")
+    monkeypatch.setenv("MORAY_API_TYPE", "openai")
+    monkeypatch.setenv("MORAY_API_KEY", "super-secret")
+    client = TestClient(create_app())
+
+    response = client.get("/api/config")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "model": "gpt-4o-mini",
+        "base_url": "https://api.example.com/v1",
+        "api_type": "openai",
+        "has_api_key": True,
+    }
+    # The browser may prefill non-secrets; the key itself never leaves the server.
+    assert "super-secret" not in response.text
+
+
+def test_config_falls_back_to_built_in_defaults(monkeypatch):
+    for name in ("MORAY_MODEL", "MORAY_BASE_URL", "MORAY_API_TYPE", "MORAY_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    client = TestClient(create_app())
+
+    body = client.get("/api/config").json()
+
+    assert body == {
+        "model": "qwen2.5-coder:7b",
+        "base_url": "http://localhost:11434",
+        "api_type": "ollama",
+        "has_api_key": False,
+    }
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "0", "-5"])
+def test_timeout_default_falls_back_to_120(monkeypatch, raw):
+    """A typo in MORAY_TIMEOUT must not break the console."""
+    monkeypatch.setenv("MORAY_TIMEOUT", raw)
+
+    assert web_server._timeout_default() == 120.0
+
+
 # --------------------------------------------------------------------------- /
 # POST /api/refactor
 # ---------------------------------------------------------------------------
@@ -368,6 +411,55 @@ def test_build_orchestrator_builds_real_engine(tmp_path):
     orchestrator = web_server.build_orchestrator(payload, repo, EventBus())
 
     assert isinstance(orchestrator, Orchestrator)
+
+
+def test_build_orchestrator_uses_environment_defaults(tmp_path, monkeypatch):
+    """A Docker deployment configures the console through its environment."""
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv("MORAY_MODEL", "env-model")
+    monkeypatch.setenv("MORAY_BASE_URL", "https://env.example/v1")
+    monkeypatch.setenv("MORAY_API_TYPE", "openai")
+    monkeypatch.setenv("MORAY_TIMEOUT", "30")
+    captured: dict[str, object] = {}
+
+    class RecordingParser:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(web_server, "IntentParser", RecordingParser)
+    payload = RefactorRequest(intent="x", repo_path=str(repo))
+
+    web_server.build_orchestrator(payload, repo, EventBus())
+
+    assert captured["model"] == "env-model"
+    assert captured["base_url"] == "https://env.example/v1"
+    assert captured["api_type"] == "openai"
+    assert captured["timeout"] == 30.0
+
+
+def test_build_orchestrator_request_values_win_over_environment(tmp_path, monkeypatch):
+    repo = _fake_repo(tmp_path)
+    monkeypatch.setenv("MORAY_MODEL", "env-model")
+    captured: dict[str, object] = {}
+
+    class RecordingParser:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(web_server, "IntentParser", RecordingParser)
+    payload = RefactorRequest(
+        intent="x",
+        repo_path=str(repo),
+        model="request-model",
+        base_url="https://request.example/v1",
+        api_type="anthropic",
+    )
+
+    web_server.build_orchestrator(payload, repo, EventBus())
+
+    assert captured["model"] == "request-model"
+    assert captured["base_url"] == "https://request.example/v1"
+    assert captured["api_type"] == "anthropic"
 
 
 def test_build_orchestrator_rejects_unknown_api_type(tmp_path):

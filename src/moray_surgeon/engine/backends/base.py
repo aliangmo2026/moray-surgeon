@@ -8,10 +8,14 @@ single language-agnostic wire protocol.
 
 The reference implementation is
 :class:`moray_surgeon.engine.backends.python_backend.PythonBackend` (libcst for
-the AST surgery, Jedi for project-aware reference resolution). Adding a
-language means subclassing this ABC, implementing every atom for that
-language's toolchain and calling :func:`register_backend` with the suffixes it
-claims; the dispatcher, the schema and the orchestrator are untouched.
+the AST surgery, Jedi for project-aware reference resolution). The second is
+:class:`moray_surgeon.engine.backends.typescript_backend.TypeScriptBackend`
+(ts-morph behind a Node.js JSON-RPC bridge). Adding a language means subclassing
+this ABC, implementing every atom for that language's toolchain and calling
+:func:`register_backend` with the suffixes it claims; the dispatcher, the schema
+and the orchestrator are untouched. An atom that does not make sense in a
+language raises ``UnsupportedOperationError`` rather than editing nothing
+silently.
 
 Method signatures deliberately mirror the legacy atom functions one to one, so
 a backend is a transparent seam: single-file atoms are ``source`` in /

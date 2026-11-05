@@ -39,6 +39,9 @@ if TYPE_CHECKING:
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _DEFAULT_PORT = 8080
+_DEFAULT_MODEL = "qwen2.5-coder:7b"
+_DEFAULT_BASE_URL = "http://localhost:11434"
+_DEFAULT_API_TYPE = "ollama"
 # Heartbeat interval for the SSE stream: comments keep intermediaries from
 # closing an idle connection and give the client a liveness signal.
 _SSE_KEEPALIVE_SECONDS = 15.0
@@ -182,9 +185,11 @@ class RefactorRequest(BaseModel):
 
     intent: str = Field(min_length=1)
     repo_path: str
-    model: str = "qwen2.5-coder:7b"
-    base_url: str = "http://localhost:11434"
-    api_type: str = "ollama"
+    # None means "use the server environment / built-in default": the browser
+    # prefills these from GET /api/config, and API clients may omit them.
+    model: str | None = None
+    base_url: str | None = None
+    api_type: str | None = None
     api_key: str | None = None
     max_attempts: int = Field(default=3, ge=1, le=10)
     dry_run: bool = False
@@ -242,22 +247,58 @@ def _scan_target_files(repo: Path) -> list[str]:
     return [p.as_posix() for p in kept[:50]]
 
 
+def _env_default(name: str, fallback: str) -> str:
+    """Read a non-secret model setting, ignoring empty environment values."""
+    return os.environ.get(name, "").strip() or fallback
+
+
+def _model_default() -> str:
+    """Model name from ``MORAY_MODEL`` or the built-in default."""
+    return _env_default("MORAY_MODEL", _DEFAULT_MODEL)
+
+
+def _base_url_default() -> str:
+    """Model API root from ``MORAY_BASE_URL`` or the built-in default."""
+    return _env_default("MORAY_BASE_URL", _DEFAULT_BASE_URL)
+
+
+def _api_type_default() -> str:
+    """Transport dialect from ``MORAY_API_TYPE`` or the built-in default."""
+    return _env_default("MORAY_API_TYPE", _DEFAULT_API_TYPE)
+
+
+def _timeout_default() -> float:
+    """Per-request model timeout from ``MORAY_TIMEOUT`` (120 s when invalid)."""
+    raw = os.environ.get("MORAY_TIMEOUT", "").strip()
+    if not raw:
+        return 120.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 120.0
+    return value if value > 0 else 120.0
+
+
 def build_orchestrator(payload: RefactorRequest, repo: Path, trace_bus: EventBus) -> Orchestrator:
     """Wire the engine exactly like the CLI does (public so tests can patch it).
 
     Falls back to ``MORAY_API_KEY`` when the request carries no key, mirroring
     the CLI credential rules: the secret lives server-side and the browser
-    never needs to send it. ``mypy`` targets ``src`` when the repository has
-    one, else the repository root (flat demo repositories must verify too).
+    never needs to send it. ``model``/``base_url``/``api_type`` fall back to
+    ``MORAY_MODEL``/``MORAY_BASE_URL``/``MORAY_API_TYPE``, which is what lets a
+    Docker deployment configure the console entirely through its environment.
+    ``mypy`` targets ``src`` when the repository has one, else the repository
+    root (flat demo repositories must verify too).
     """
     api_key = payload.api_key or os.environ.get("MORAY_API_KEY") or None
     mypy_target = "src" if (repo / "src").is_dir() else "."
     return Orchestrator(
         parser=IntentParser(
-            model=payload.model,
-            base_url=payload.base_url,
+            model=payload.model or _model_default(),
+            base_url=payload.base_url or _base_url_default(),
+            timeout=_timeout_default(),
             api_key=api_key,
-            api_type=payload.api_type,
+            api_type=payload.api_type or _api_type_default(),
         ),
         verifier=Verifier(repo, mypy_target=mypy_target),
         max_attempts=payload.max_attempts,
@@ -328,6 +369,22 @@ def create_app(bus: EventBus | None = None) -> FastAPI:
     async def health() -> dict[str, str]:
         """Liveness probe; the page also reads the version from here."""
         return {"status": "ok", "version": __version__}
+
+    @app.get("/api/config")
+    async def config() -> dict[str, str | bool]:
+        """Expose non-secret model defaults for the browser form.
+
+        Docker and other private deployments configure the console through
+        ``MORAY_MODEL`` / ``MORAY_BASE_URL`` / ``MORAY_API_TYPE``. The page
+        fetches this on load and prefills the three inputs. The API key is never
+        returned -- only whether the server already holds one.
+        """
+        return {
+            "model": _model_default(),
+            "base_url": _base_url_default(),
+            "api_type": _api_type_default(),
+            "has_api_key": bool(os.environ.get("MORAY_API_KEY", "").strip()),
+        }
 
     @app.get("/api/stream")
     async def stream(request: Request) -> StreamingResponse:

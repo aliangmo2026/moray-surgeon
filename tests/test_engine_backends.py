@@ -207,10 +207,11 @@ def test_backend_for_resolves_python_suffixes(tmp_path):
 
 def test_backend_for_unknown_suffix_raises_with_registered_list(tmp_path):
     with pytest.raises(UnsupportedLanguageError) as excinfo:
-        backend_for(tmp_path / "main.ts")
+        backend_for(tmp_path / "main.rs")
 
-    assert "'.ts'" in str(excinfo.value)
+    assert "'.rs'" in str(excinfo.value)
     assert ".pyi" in str(excinfo.value)  # the registered suffix list is in the message
+    assert ".ts" in str(excinfo.value)  # TypeScript is registered too
 
 
 def test_backend_for_suffixless_file_raises(tmp_path):
@@ -385,31 +386,31 @@ def test_execute_plan_routes_move_symbol(clean_registry, tmp_path):
 
 def test_execute_plan_rejects_unsupported_language_before_touching_the_file(tmp_path):
     """Schema accepts any suffix; the dispatcher is the language gatekeeper."""
-    (tmp_path / "app.ts").write_text("const x = 1;\n", encoding="utf-8")
+    (tmp_path / "app.rs").write_text("fn main() {}\n", encoding="utf-8")
     plan = RefactorPlan(
         instructions=[
-            ReplaceCall(id="i1", target_file="app.ts", old_call="a()", new_call="b()")
+            ReplaceCall(id="i1", target_file="app.rs", old_call="a()", new_call="b()")
         ]
     )
 
     with pytest.raises(UnsupportedLanguageError) as excinfo:
         execute_plan(plan, tmp_path)
 
-    assert "'.ts'" in str(excinfo.value)
+    assert "'.rs'" in str(excinfo.value)
     # Nothing was read, parsed or written: the file is byte-for-byte intact.
-    assert (tmp_path / "app.ts").read_text(encoding="utf-8") == "const x = 1;\n"
+    assert (tmp_path / "app.rs").read_text(encoding="utf-8") == "fn main() {}\n"
 
 
 def test_execute_plan_rejects_move_to_unregistered_language(tmp_path):
     (tmp_path / "a.py").write_text(_PY_SOURCE, encoding="utf-8")
-    (tmp_path / "b.ts").write_text("// typescript\n", encoding="utf-8")
+    (tmp_path / "b.rs").write_text("// rust\n", encoding="utf-8")
     plan = RefactorPlan(
         instructions=[
-            MoveSymbol(id="i1", source_file="a.py", target_file="b.ts", symbol_name="old_name")
+            MoveSymbol(id="i1", source_file="a.py", target_file="b.rs", symbol_name="old_name")
         ]
     )
 
-    with pytest.raises(UnsupportedLanguageError, match=r"'\.ts'"):
+    with pytest.raises(UnsupportedLanguageError, match=r"'\.rs'"):
         execute_plan(plan, tmp_path)
 
 

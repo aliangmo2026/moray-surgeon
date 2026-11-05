@@ -1,0 +1,29 @@
+# Keep the build context small and OS-independent. The image installs its own
+# Node dependencies; copying node_modules from the host would bring the wrong
+# platform binaries (or Windows symlinks) into the container.
+.git
+.github
+.gitignore
+.venv
+venv
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/.moray-cache
+**/node_modules
+dist
+build
+*.egg-info
+.coverage
+coverage.xml
+htmlcov
+.mimosa
+workspace
+docs
+tests
+scripts
+.env
+.env.*
+moray-skill.zip

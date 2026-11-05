@@ -14,3 +14,8 @@ build/
 *.egg-info/
 .mimosa/
 moray-skill.zip
+# Docker workspace mount (user repositories and the code-index cache).
+workspace/
+# Node dependencies for the TypeScript bridge: install with
+# scripts/setup_ts_backend.sh (or .ps1); package-lock.json is committed.
+src/moray_surgeon/engine/backends/ts_bridge/node_modules/

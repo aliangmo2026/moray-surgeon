@@ -125,7 +125,28 @@ class UnsupportedLanguageError(MorayError):
 
     The dispatcher resolves a backend from ``target_file``'s suffix *before*
     reading or writing any byte, so a plan naming a file whose language has no
-    registered backend (today: everything except ``.py``/``.pyi``) fails up
+    registered backend (today: anything except Python and TypeScript) fails up
     front with this error instead of halfway inside a language-specific parser.
+    """
+
+
+class UnsupportedOperationError(MorayError):
+    """A registered backend does not implement the requested atom.
+
+    A language backend may support only part of the protocol — the TypeScript
+    backend implements parsing, verification, rename and five other atoms, but
+    not the Python-specific ``add_type_hints``/``convert_to_match_case`` or the
+    project-aware ``move_symbol`` family. Raising this instead of silently
+    editing nothing keeps the failure visible to the transaction.
+    """
+
+
+class TypeScriptBridgeError(MorayError):
+    """The Node.js TypeScript bridge could not be started or answered badly.
+
+    Covers a missing ``node`` executable, missing ``ts-morph`` dependencies, a
+    timeout, a malformed response and a JSON-RPC internal error. Application
+    errors (an invalid range, an unknown symbol) are reported as ``ValueError``
+    so the dispatcher classifies them exactly like a Python atom rejection.
     """
 

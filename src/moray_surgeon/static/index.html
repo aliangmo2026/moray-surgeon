@@ -281,6 +281,14 @@ es.addEventListener("result",   (e) => { try { render(JSON.parse(unwrap(e))); } 
 
 fetch("/api/health").then((r) => r.json()).then((h) => { $("ver").textContent = "v" + h.version; }).catch(() => {});
 
+/* Server-side defaults (Docker / private deployment) prefill the form. */
+fetch("/api/config").then((r) => (r.ok ? r.json() : null)).then((cfg) => {
+  if (!cfg) return;
+  if (cfg.model) $("model").value = cfg.model;
+  if (cfg.base_url) $("base").value = cfg.base_url;
+  if (cfg.api_type) $("api").value = cfg.api_type;
+}).catch(() => {});
+
 /* ---------- terminal log ---------- */
 function log(text, cls) {
   const box = $("log");

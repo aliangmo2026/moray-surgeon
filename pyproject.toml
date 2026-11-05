@@ -49,8 +49,14 @@ where = ["src"]
 
 # The web console ships its single-page UI as a static asset next to the
 # web_server module; without this block the wheel would serve a 404 landing page.
+# The TypeScript bridge is a source asset too: ts-morph itself is installed by
+# scripts/setup_ts_backend.sh (npm), never by pip.
 [tool.setuptools.package-data]
-moray_surgeon = ["static/*.html"]
+moray_surgeon = [
+    "static/*.html",
+    "engine/backends/ts_bridge/*.mjs",
+    "engine/backends/ts_bridge/package.json",
+]
 
 # Single source of truth lives in moray_surgeon/__init__.py; duplicating the
 # version string here would let the wheel metadata silently drift.

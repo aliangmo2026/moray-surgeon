@@ -250,6 +250,58 @@ Measured on Windows 11 / CPython 3.12.2 / 16 logical cores, 10 modules × 4,800 
 
 Both runs produce byte-identical files (the script checks this before reporting). Process startup is not free: on ten 240-line modules the same pool is ~3× *slower* than one process (0.39 s → 1.34 s), because spawn costs more than the whole refactor. Parallelism pays off once per-file work dominates that fixed cost.
 
+## TypeScript backend (Node.js bridge)
+
+The engine is language-agnostic behind `LanguageBackend`; TypeScript is the second implementation. Python does not parse TypeScript, so the backend delegates AST work to a checked-in Node.js bridge (`src/moray_surgeon/engine/backends/ts_bridge/bridge.mjs`) that runs the TypeScript compiler through [ts-morph](https://ts-morph.com/). Every call is one JSON-RPC 2.0 request on stdin and one response on stdout; a fresh Node process per operation keeps timeouts and crashes isolated.
+
+Supported atoms for `.ts` / `.tsx`:
+
+| Atom | Behaviour |
+|---|---|
+| `parse` / `verify_syntax` | TypeScript compiler diagnostics; syntax-only, no type checking |
+| `rename_symbol` | ts-morph LanguageService: the definition plus every reference, including import specifiers and call sites, written atomically |
+| `extract_variable` | the expression at the given range becomes a `const`, inserted before its statement |
+| `extract_function` | top-level statements in the line range become a function plus an immediate call |
+| `replace_call` | callee text replacement; arguments untouched |
+| `add_import` / `remove_import` | named, aliased and side-effect imports; merges into an existing declaration |
+
+The Python-specific atoms (`add_type_hints`, `convert_to_match_case`) and the not-yet-ported project-aware atoms (`inline_variable`, `inline_function`, `remove_dead_code`, `split_class`, `move_symbol`) raise `UnsupportedOperationError`; nothing is edited silently.
+
+### Setup
+
+Node.js 18+ and npm are required at call time, not at import time:
+
+```bash
+bash scripts/setup_ts_backend.sh                                           # macOS / Linux / Git Bash
+powershell -ExecutionPolicy Bypass -File scripts\setup_ts_backend.ps1      # Windows
+```
+
+The script runs `npm ci` in `ts_bridge/` and ping-tests the bridge. Point the backend elsewhere with `MORAY_NODE` (Node executable) or `MORAY_TS_BRIDGE` (bridge script). The JSON-RPC protocol is pinned by `tests/fixtures/fake_ts_bridge.py`, so `pytest tests/test_engine_typescript.py` also runs without Node; the real ts-morph tests skip with an install hint.
+
+### Protocol
+
+```jsonc
+// request
+{"jsonrpc":"2.0","id":1,"method":"rename",
+ "params":{"repoRoot":"/repo","targetFile":"src/a.ts",
+           "oldName":"oldName","newName":"newName"}}
+// success
+{"jsonrpc":"2.0","id":1,"result":{"changes":3,
+ "files":[{"path":"src/a.ts","text":"..."},{"path":"src/b.ts","text":"..."}]}}
+// rejection (-32602 invalid params, -32000 operation failed) -> ValueError
+{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"no definition of 'oldName' found in src/a.ts"}}
+```
+
+Paths in a result are repository-relative; the bridge never writes. Python re-validates containment and performs atomic writes, so a bridge bug cannot escape the repository.
+
+### Limits
+
+- The schema's `module` field is still a dotted path: `add_import` / `remove_import` accept bare packages (`react`) but not `./util` or `@org/pkg` until the protocol widens.
+- `extract_variable` columns are UTF-16 code units (JavaScript string indices); ASCII ranges are identical to Python columns.
+- `rename_symbol` loads the project per call — a `tsconfig.json` when present, otherwise a `**/*.ts` / `**/*.tsx` glob. Very large repositories pay that cost on every rename.
+- `parse`, `verify_syntax` and the source-in/source-out atoms use the non-JSX TypeScript grammar; `rename_symbol` handles `.tsx` files normally.
+- The code map, AST scope guard, runtime-equivalence sandbox and the default `Verifier` (ruff/mypy/pytest) are Python-oriented. TypeScript edits get the dispatcher's path/DAG/batch guarantees, but a TypeScript-only project should drive `execute_plan` directly or supply a TS-aware verifier instead of relying on those Python gates.
+
 ## Quick start
 
 **Requirements:** Python 3.11+, Git, and either a local [Ollama](https://ollama.com/) instance or a cloud API (OpenAI- or Anthropic-compatible). The default local path keeps the code and the model on your machine; nothing is sent anywhere.
@@ -342,6 +394,24 @@ moray-surgeon refactor "Rename parse_args to parse_cli_options" --path . --files
 | `--clear-cache` | off | Delete the [code index](#large-project-performance-the-code-index) and rebuild it before running |
 
 Exit codes: `0` success, `1` refactor or verification failure, `2` not a Git repository. The read-only [`audit`](#use-as-a-ci-gateway) command has its own flags and exit codes.
+
+## Private deployment (Docker)
+
+For an internal network, the repository ships a single image containing the web console, the CLI, Git, Node.js 22 with the TypeScript bridge, and the verification tools. No Python or Node installation is needed on the host.
+
+```bash
+cp .env.example .env        # set the model provider and API key
+docker compose up -d --build
+# console: http://localhost:8080
+```
+
+Every repository to refactor goes under the mounted workspace (`./workspace` by default) and is addressed as `/workspace/<repo>` in the console. The model inputs are prefilled from the container environment. To run a model locally instead of calling a cloud API:
+
+```bash
+docker compose --profile ollama up -d --build   # pulls MORAY_MODEL on first start
+```
+
+The console binds to `127.0.0.1` by default and has no built-in login; put it behind an authenticating TLS reverse proxy before exposing it. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for permissions, air-gapped installs, configuration and troubleshooting.
 
 ## MCP integration
 

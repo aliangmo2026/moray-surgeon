@@ -1,0 +1,93 @@
+# moray-surgeon — one-command private deployment.
+#
+#   cp .env.example .env      # set the model provider and API key
+#   docker compose up -d --build
+#   open http://localhost:8080
+#
+# The console is bound to 127.0.0.1 by default. Put a TLS reverse proxy in front
+# of it before exposing it on a network; the dashboard has no built-in login.
+#
+# Fully local model (downloads the model on first start):
+#   docker compose --profile ollama up -d --build
+
+name: moray-surgeon
+
+services:
+  moray-surgeon:
+    build:
+      context: .
+      args:
+        # Let a Linux bind mount be owned by the host user. Override in .env
+        # with MORAY_UID=$(id -u) MORAY_GID=$(id -g).
+        MORAY_UID: ${MORAY_UID:-1000}
+        MORAY_GID: ${MORAY_GID:-1000}
+    image: moray-surgeon:local
+    container_name: moray-surgeon
+    init: true
+    restart: unless-stopped
+    ports:
+      # Host address:port -> container 8080. Keep 127.0.0.1 unless the console
+      # sits behind an authenticating reverse proxy.
+      - "${MORAY_BIND_HOST:-127.0.0.1}:${MORAY_PORT:-8080}:8080"
+    volumes:
+      # Every git repository you want to refactor must live inside this folder;
+      # in the console use paths such as /workspace/my-repo.
+      - "${MORAY_WORKSPACE:-./workspace}:/workspace"
+    working_dir: /workspace
+    environment:
+      # --- model provider (see .env.example) ---
+      MORAY_API_TYPE: ${MORAY_API_TYPE:-ollama}
+      MORAY_MODEL: ${MORAY_MODEL:-qwen2.5-coder:7b}
+      MORAY_BASE_URL: ${MORAY_BASE_URL:-http://ollama:11434}
+      MORAY_API_KEY: ${MORAY_API_KEY:-}
+      MORAY_TIMEOUT: ${MORAY_TIMEOUT:-120}
+      # --- engine ---
+      MORAY_MAX_WORKERS: ${MORAY_MAX_WORKERS:-4}
+      # --- commit identity used by the transaction layer ---
+      GIT_AUTHOR_NAME: ${MORAY_GIT_NAME:-moray-surgeon}
+      GIT_AUTHOR_EMAIL: ${MORAY_GIT_EMAIL:-moray-surgeon@localhost}
+      GIT_COMMITTER_NAME: ${MORAY_GIT_NAME:-moray-surgeon}
+      GIT_COMMITTER_EMAIL: ${MORAY_GIT_EMAIL:-moray-surgeon@localhost}
+    security_opt:
+      - no-new-privileges:true
+
+  # Optional local model server. Inactive unless --profile ollama is used.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: moray-ollama
+    profiles: ["ollama"]
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    # The app reaches Ollama as http://ollama:11434 on the compose network.
+    # Publish it on the host only for debugging:
+    # ports:
+    #   - "127.0.0.1:11434:11434"
+    # NVIDIA GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # One-shot: wait for the Ollama server, then pull MORAY_MODEL. It exits 0 when
+  # the model is ready; `docker compose logs -f ollama-pull` shows the progress.
+  # The model name is interpolated by Compose from .env, so no shell escaping.
+  ollama-pull:
+    image: ollama/ollama:latest
+    profiles: ["ollama"]
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until ollama list >/dev/null 2>&1; do sleep 2; done
+        ollama pull "${MORAY_MODEL:-qwen2.5-coder:7b}"
+    restart: "no"
+
+volumes:
+  ollama-models:
